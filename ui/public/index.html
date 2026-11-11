@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Claude File Manager — folder setup</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+            <path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" />
+          </svg>
+        </span>
+        <span class="title">Claude File Manager</span>
+        <span class="badge">MCP</span>
+      </div>
+      <div class="status"><span class="dot"></span> runs locally</div>
+    </header>
+
+    <main class="layout">
+      <section class="card">
+        <div class="card-head">
+          <h2>1. Choose a working folder</h2>
+          <p class="muted">
+            Claude can create, edit and delete files only inside this folder.
+          </p>
+        </div>
+
+        <div class="pathbar">
+          <button id="up" class="icon-btn" type="button" title="Go up one level" aria-label="Go up one level">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 19V5M5 12l7-7 7 7" />
+            </svg>
+          </button>
+          <input id="pathInput" type="text" spellcheck="false" autocomplete="off" aria-label="Folder path" />
+          <button id="go" class="ghost" type="button">Go</button>
+          <button id="pickNative" class="ghost" type="button" title="Open the system folder picker">Browse…</button>
+        </div>
+
+        <div id="recentRow" class="recent" hidden>
+          <span class="recent-label">Recent</span>
+          <div id="recent" class="recent-list"></div>
+        </div>
+
+        <div id="drives" class="drives" aria-label="Drives"></div>
+        <div id="crumbs" class="crumbs" aria-label="Path"></div>
+        <div id="folders" class="folders" role="listbox" aria-label="Folders"></div>
+        <p id="browseNote" class="hint" hidden></p>
+
+        <div class="selection">
+          <div class="selection-path">
+            <span class="label">Saved folder</span>
+            <code id="currentRoot">…</code>
+          </div>
+          <div class="sel-actions">
+            <button id="openFolder" class="ghost" type="button">Open</button>
+            <button id="pick" class="primary" type="button">Use this folder</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>2. Connect to Claude</h2>
+          <p class="muted">
+            The settings are written to the Claude Desktop config. A backup is
+            created automatically before any change.
+          </p>
+        </div>
+
+        <div id="connStatus" class="conn-status">
+          <span class="dot"></span>
+          <span id="connText">Checking settings…</span>
+        </div>
+
+        <label class="checkbox">
+          <input type="checkbox" id="allowOutside" />
+          <span>
+            Allow access to the whole file system
+            <small>Not recommended: Claude will be able to change any accessible file.</small>
+          </span>
+        </label>
+
+        <div class="actions">
+          <button id="connectDesktop" class="primary" type="button">
+            Connect to Claude Desktop
+          </button>
+          <button id="checkServer" class="ghost" type="button">Check server</button>
+          <button id="copyCode" class="ghost" type="button">Claude Code command</button>
+          <button id="copyConfig" class="ghost" type="button">Copy JSON</button>
+        </div>
+
+        <div id="checkResult" class="check-result" hidden></div>
+
+        <div id="log" class="log" hidden></div>
+
+        <dl class="meta">
+          <div>
+            <dt>Server</dt>
+            <dd id="serverPath">…</dd>
+          </div>
+          <div>
+            <dt>Claude Desktop config</dt>
+            <dd id="configPath">…</dd>
+          </div>
+        </dl>
+
+        <details class="preview">
+          <summary>Show the current JSON config</summary>
+          <pre id="preview"></pre>
+        </details>
+      </section>
+    </main>
+
+    <footer class="footer">
+      Data never leaves your computer. The UI is reachable only on
+      127.0.0.1.
+    </footer>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

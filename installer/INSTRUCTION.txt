@@ -1,0 +1,106 @@
+CLAUDE FILE MANAGER — GETTING STARTED
+=====================================
+
+What this is
+------------
+A local MCP server for Claude Desktop. It lets Claude create, read, edit,
+search, copy, move and delete files and folders — but only inside the
+folder you choose.
+
+Everything runs on your computer. No internet is required and no data is
+sent anywhere.
+
+
+Step 1. Run the setup
+---------------------
+Open the Start menu and choose:
+
+    Claude File Manager Setup
+
+Or double-click the "Claude File Manager" shortcut on your desktop.
+
+A console window and a browser page with the setup UI will open. Keep the
+console window open while you use the setup.
+
+
+Step 2. Choose a folder
+-----------------------
+In the browser:
+
+1. Choose a folder — browse drives and subfolders, paste a path manually,
+   or click "Browse…" and pick a folder in the system dialog.
+2. Click "Use this folder".
+3. Click "Connect to Claude Desktop".
+
+The server writes the settings into the Claude Desktop config and creates
+a backup of the old config. You do not need to edit anything manually.
+
+
+Step 3. Restart Claude Desktop
+------------------------------
+Fully close Claude Desktop (including the tray icon) and open it again.
+A tools icon will appear in the input field — the server is connected.
+
+
+How to use it
+-------------
+Just write to Claude in plain language, for example:
+
+  • "Show the contents of the current folder."
+  • "Find all *.tsx files in src."
+  • "Where is MCP_FILE_ROOT used?"
+  • "Create docs/api.md and describe the endpoints from src/routes."
+  • "In config.js replace port: 3000 with 8080."
+  • "Delete temp.log."        — the file goes to the trash
+  • "Restore the last deletion."
+  • "Undo the last two changes."
+
+
+Safety
+------
+• Claude can only work inside the chosen folder.
+• Deletion is reversible by default: files go to the trash at
+  <chosen folder>\.mcp\trash.
+• A backup is saved before a file is changed; ask Claude to
+  "undo the last change" to bring it back.
+• Permanent deletion only happens when explicitly requested.
+• The UI is reachable only on this computer.
+
+To let Claude access the whole file system, enable "Allow access to the
+whole file system" in the UI. Do this consciously.
+
+
+Troubleshooting
+---------------
+1. Make sure the console window with the setup server is still open.
+2. In the UI click "Check server" — it reports whether the server responds
+   and how many tools are available.
+3. Make sure Claude Desktop was restarted completely.
+4. The Claude Desktop config is located here:
+   %APPDATA%\Claude\claude_desktop_config.json
+   It must contain a server named "files".
+5. Your antivirus may ask for permission for node.exe — allow it; this is a
+   local server with no network access.
+
+
+Uninstalling
+------------
+"Windows Settings" → "Apps" → "Installed apps" →
+"Claude File Manager" → "Uninstall".
+
+After uninstalling, the server entry stays in the Claude Desktop config.
+To remove it manually, open %APPDATA%\Claude\claude_desktop_config.json
+and delete the "files" block from "mcpServers". Alternatively, run the
+setup and connect a different folder before uninstalling.
+
+
+Where things live
+-----------------
+Install folder:
+    %LOCALAPPDATA%\ClaudeFileManager
+
+Trash and backups (inside the chosen folder):
+    .mcp\
+
+Claude Desktop config:
+    %APPDATA%\Claude\claude_desktop_config.json

@@ -1,0 +1,32 @@
+{
+  "name": "claude-file-manager-mcp",
+  "version": "1.1.0",
+  "description": "MCP server for creating, reading, editing and deleting files and folders",
+  "type": "module",
+  "bin": {
+    "claude-file-manager-mcp": "src/index.js"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "ui": "node ui/server.js",
+    "build:installer": "node installer/build.mjs",
+    "inspect": "npx @modelcontextprotocol/inspector node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^3.25.76"
+  },
+  "repository": {
+    "url": "https://github.com/sadd11/claude-file-manager-mcp.git",
+    "type": "git"
+  },
+  "homepage": "https://github.com/sadd11/claude-file-manager-mcp",
+  "bugs": {
+    "url": "https://github.com/sadd11/claude-file-manager-mcp/issues"
+  }
+}

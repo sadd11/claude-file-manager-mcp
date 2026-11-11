@@ -1,0 +1,7 @@
+node_modules/
+*.log
+ui/state.json
+.mcp/
+installer/build/
+installer/out/
+installer/app.ico
