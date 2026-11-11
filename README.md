@@ -28,7 +28,7 @@ It runs locally over `stdio`, without internet access or third-party services.
 
 ## Windows installation (prebuilt installer)
 
-File: `installer\out\ClaudeFileManager-Setup-1.1.0.exe`.
+Download **[ClaudeFileManager-Setup-1.1.0.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
 
 1. Run the installer. If Windows shows the blue SmartScreen window, click
    **More info → Run anyway** (the file has no digital signature).
@@ -43,7 +43,7 @@ File: `installer\out\ClaudeFileManager-Setup-1.1.0.exe`.
 "Claude File Manager" shortcuts appear in the Start menu and (optionally) on
 the desktop. Uninstall via **Settings → Apps**.
 
-**Portable version:** `installer\out\ClaudeFileManager-Portable-1.1.0.zip` —
+**Portable version:** **[ClaudeFileManager-Portable-1.1.0.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
 extract anywhere and run `start-ui.cmd`. No installation required.
 
 ### Building the installer
