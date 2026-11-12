@@ -49,7 +49,7 @@ const MIME = {
 /* -------------------------------------------------------------------------- */
 
 const defaultRoot = path.resolve(process.env.MCP_FILE_ROOT || PROJECT_ROOT);
-let state = { root: defaultRoot, allowOutside: false, recent: [] };
+let state = { root: defaultRoot, allowOutside: false, allowShell: false, recent: [] };
 
 async function loadState() {
   try {
@@ -59,6 +59,7 @@ async function loadState() {
       state.root = path.resolve(parsed.root);
     }
     state.allowOutside = Boolean(parsed.allowOutside);
+    state.allowShell = Boolean(parsed.allowShell);
     if (Array.isArray(parsed.recent)) {
       state.recent = parsed.recent
         .filter((item) => typeof item === "string" && item.trim())
@@ -109,6 +110,7 @@ function desktopConfigPath() {
 function buildServerEntry() {
   const env = { MCP_FILE_ROOT: state.root };
   if (state.allowOutside) env.MCP_ALLOW_OUTSIDE_ROOT = "1";
+  if (state.allowShell) env.MCP_ALLOW_SHELL = "1";
   return { command: NODE_BIN, args: [SERVER_ENTRY], env };
 }
 
@@ -124,6 +126,7 @@ function buildCodeCommand() {
     `--env MCP_FILE_ROOT=${q(state.root)}`,
   ];
   if (state.allowOutside) parts.push("--env MCP_ALLOW_OUTSIDE_ROOT=1");
+  if (state.allowShell) parts.push("--env MCP_ALLOW_SHELL=1");
   parts.push("--", q(NODE_BIN), q(SERVER_ENTRY));
   return parts.join(" ");
 }
@@ -200,6 +203,7 @@ function checkServer() {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, MCP_FILE_ROOT: state.root };
     if (state.allowOutside) env.MCP_ALLOW_OUTSIDE_ROOT = "1";
+    if (state.allowShell) env.MCP_ALLOW_SHELL = "1";
     delete env.MCP_DATA_DIR;
 
     const child = spawn(NODE_BIN, [SERVER_ENTRY], {
@@ -553,6 +557,7 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, {
       root: state.root,
       allowOutside: state.allowOutside,
+      allowShell: state.allowShell,
       recent: state.recent,
       serverEntry: SERVER_ENTRY,
       desktopConfig: desktop,
@@ -593,10 +598,14 @@ async function handleApi(req, res, url) {
     if (body.allowOutside !== undefined) {
       state.allowOutside = Boolean(body.allowOutside);
     }
+    if (body.allowShell !== undefined) {
+      state.allowShell = Boolean(body.allowShell);
+    }
     await saveState();
     return sendJson(res, 200, {
       root: state.root,
       allowOutside: state.allowOutside,
+      allowShell: state.allowShell,
       recent: state.recent,
     });
   }

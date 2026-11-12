@@ -229,6 +229,7 @@ async function refreshStatus() {
   recentList = state.recent || [];
   $("currentRoot").textContent = state.root;
   $("allowOutside").checked = state.allowOutside;
+  $("allowShell").checked = state.allowShell;
   $("serverPath").textContent = state.serverEntry;
   $("configPath").textContent =
     state.desktopConfig + (state.desktopExists ? "" : " (no file yet)");
@@ -257,6 +258,7 @@ async function setState(patch, okMessage) {
   recentList = data.recent || [];
   $("currentRoot").textContent = data.root;
   $("allowOutside").checked = data.allowOutside;
+  $("allowShell").checked = data.allowShell;
   renderRecent(recentList, current?.path || data.root);
   await refreshPreview();
   updateConnStatus(await api("/api/state"));
@@ -381,6 +383,15 @@ $("checkServer").addEventListener("click", async () => {
 $("allowOutside").addEventListener("change", async (e) => {
   try {
     await setState({ allowOutside: e.target.checked }, "Setting saved");
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    toast(err.message, true);
+  }
+});
+
+$("allowShell").addEventListener("change", async (e) => {
+  try {
+    await setState({ allowShell: e.target.checked }, "Setting saved");
   } catch (err) {
     e.target.checked = !e.target.checked;
     toast(err.message, true);

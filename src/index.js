@@ -6,11 +6,14 @@
  *   list_directory, read_file, write_file, append_file, edit_file, multi_edit,
  *   create_directory, move_path, copy_path, delete_path, file_info,
  *   find_files, search_content, list_trash, restore_path, undo_last_change
+ *   and optionally run_command (terminal, disabled by default).
  *
  * Safety:
  *   All operations are limited to MCP_FILE_ROOT (defaults to the current
  *   working directory). To allow arbitrary paths, set
  *   MCP_ALLOW_OUTSIDE_ROOT=1.
+ *   The terminal tool is only registered when MCP_ALLOW_SHELL=1 is set.
+ *   Commands run with the rights of the current user and are not sandboxed.
  *
  * Trash and backups are stored in <root>/.mcp.
  */
@@ -22,6 +25,7 @@ import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 
 const ROOT = path.resolve(process.env.MCP_FILE_ROOT || process.cwd());
 const ALLOW_OUTSIDE = /^(1|true|yes)$/i.test(
@@ -29,6 +33,10 @@ const ALLOW_OUTSIDE = /^(1|true|yes)$/i.test(
 );
 const MAX_READ_CHARS = Number(process.env.MCP_MAX_READ_CHARS || 400_000);
 const MAX_LIST_ENTRIES = Number(process.env.MCP_MAX_LIST_ENTRIES || 5_000);
+const ALLOW_SHELL = /^(1|true|yes)$/i.test(process.env.MCP_ALLOW_SHELL || "");
+const MAX_OUTPUT_CHARS = Number(process.env.MCP_MAX_OUTPUT_CHARS || 200_000);
+const SHELL_TIMEOUT_DEFAULT = 30_000;
+const SHELL_TIMEOUT_MAX = 300_000;
 
 const DATA_DIR = process.env.MCP_DATA_DIR
   ? path.resolve(process.env.MCP_DATA_DIR)
@@ -37,6 +45,7 @@ const TRASH_DIR = path.join(DATA_DIR, "trash");
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
 const TRASH_INDEX = path.join(DATA_DIR, "trash.json");
 const ACTIVITY_FILE = path.join(DATA_DIR, "activity.json");
+const SHELL_LOG = path.join(DATA_DIR, "commands.log");
 
 const DEFAULT_IGNORES = ["node_modules", ".git", ".mcp", ".svn", ".hg"];
 const MAX_ACTIVITY = 100;
@@ -393,13 +402,235 @@ function countOccurrences(haystack, needle) {
   return count;
 }
 
+/* ---------------------------------- shell --------------------------------- */
+
+const SHELL_MODE = (
+  process.env.MCP_SHELL || (process.platform === "win32" ? "powershell" : "sh")
+).toLowerCase();
+
+/**
+ * Builds the platform shell invocation for a command string.
+ *
+ * On Windows the default is PowerShell with `-EncodedCommand` (UTF-16LE), so
+ * Cyrillic and other non-ASCII text survives in both directions — cmd.exe
+ * mangles such arguments down to the OEM code page. Set MCP_SHELL=cmd to use
+ * cmd.exe instead, or MCP_SHELL=pwsh for PowerShell 7.
+ */
+function shellInvocation(command) {
+  if (process.platform === "win32") {
+    if (SHELL_MODE === "cmd") {
+      return {
+        file: process.env.ComSpec || "cmd.exe",
+        args: ["/d", "/s", "/c", command],
+        shellName: "cmd",
+      };
+    }
+
+    const script = [
+      "$ProgressPreference = 'SilentlyContinue'",
+      "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+      "$OutputEncoding = [System.Text.Encoding]::UTF8",
+      "$global:LASTEXITCODE = 0",
+      command,
+      "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+      "if ($Error.Count -gt 0) { exit 1 }",
+    ].join("\r\n");
+
+    return {
+      file: SHELL_MODE === "pwsh" ? "pwsh.exe" : "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ],
+      shellName: SHELL_MODE === "pwsh" ? "pwsh" : "powershell",
+    };
+  }
+
+  return {
+    file: SHELL_MODE === "bash" ? "bash" : "/bin/sh",
+    args: ["-c", command],
+    shellName: SHELL_MODE === "bash" ? "bash" : "sh",
+  };
+}
+
+function killProcessTree(pid) {
+  if (!pid) return;
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function appendCapped(state, chunk) {
+  if (state.truncated) return;
+  const next = state.text + chunk;
+  if (next.length > MAX_OUTPUT_CHARS) {
+    state.text = next.slice(0, MAX_OUTPUT_CHARS);
+    state.truncated = true;
+    return;
+  }
+  state.text = next;
+}
+
+/**
+ * powershell.exe serializes its error stream as CLIXML when stderr is a pipe.
+ * Turn that back into plain text so Claude sees readable messages.
+ */
+function decodePowerShellStderr(raw) {
+  if (!raw.startsWith("#< CLIXML")) return raw;
+
+  const parts = [...raw.matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map((m) => m[1]);
+  const source = parts.length ? parts.join("") : raw;
+
+  return source
+    .replace(/_x000D__x000A_/g, "\n")
+    .replace(/_x000D_/g, "\r")
+    .replace(/_x000A_/g, "\n")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .trim();
+}
+
+function runCommand(command, cwd, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const { file, args, shellName } = shellInvocation(command);
+    const startedAt = Date.now();
+
+    const child = spawn(file, args, {
+      cwd,
+      windowsHide: true,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        // Keep child output stable across platforms.
+        GIT_PAGER: "cat",
+        PAGER: "cat",
+        NO_COLOR: "1",
+        TERM: "dumb",
+      },
+    });
+
+    const out = { text: "", truncated: false };
+    const err = { text: "", truncated: false };
+    let timedOut = false;
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child.pid);
+    }, timeoutMs);
+
+    function finish(code, signal, spawnError) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const durationMs = Date.now() - startedAt;
+      const stderrText =
+        shellName.startsWith("powershell") || shellName === "pwsh"
+          ? decodePowerShellStderr(err.text)
+          : err.text;
+      resolve({
+        command,
+        cwd,
+        shell: shellName,
+        code: typeof code === "number" ? code : null,
+        signal: signal || null,
+        timedOut,
+        durationMs,
+        stdout: out.text,
+        stdoutTruncated: out.truncated,
+        stderr: stderrText,
+        stderrTruncated: err.truncated,
+        spawnError: spawnError || null,
+      });
+    }
+
+    child.on("error", (error) => finish(null, null, error));
+    child.on("close", (code, signal) => finish(code, signal));
+    child.stdout?.on("data", (chunk) => appendCapped(out, chunk.toString("utf8")));
+    child.stderr?.on("data", (chunk) => appendCapped(err, chunk.toString("utf8")));
+  });
+}
+
+async function logCommand(result) {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    const line =
+      JSON.stringify({
+        at: new Date().toISOString(),
+        cwd: result.cwd,
+        command: result.command,
+        exitCode: result.code,
+        timedOut: result.timedOut,
+        durationMs: result.durationMs,
+      }) + "\n";
+    await fs.appendFile(SHELL_LOG, line, "utf8");
+  } catch {
+    /* logging must never break a command */
+  }
+}
+
+function formatCommandResult(result) {
+  const status = result.spawnError
+    ? `Failed to start: ${result.spawnError.message}`
+    : result.timedOut
+      ? `Stopped after the timeout (${result.durationMs} ms)`
+      : `Exit code: ${result.code ?? "unknown"}${
+          result.signal ? ` (signal ${result.signal})` : ""
+        } (${(result.durationMs / 1000).toFixed(2)} s)`;
+
+  const parts = [
+    `$ ${result.command}`,
+    `shell: ${result.shell} · folder: ${result.cwd}`,
+    status,
+  ];
+
+  parts.push("", "--- stdout ---", result.stdout.trimEnd() || "(empty)");
+  if (result.stdoutTruncated) {
+    parts.push(`… stdout truncated to ${MAX_OUTPUT_CHARS} characters.`);
+  }
+
+  if (result.stderr.trim()) {
+    parts.push("", "--- stderr ---", result.stderr.trimEnd());
+    if (result.stderrTruncated) {
+      parts.push(`… stderr truncated to ${MAX_OUTPUT_CHARS} characters.`);
+    }
+  }
+
+  return parts.join("\n");
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                   Server                                  */
 /* -------------------------------------------------------------------------- */
 
 const server = new McpServer({
   name: "claude-file-manager",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 server.registerTool(
@@ -1488,6 +1719,78 @@ server.registerTool(
   },
 );
 
+/* --------------------------------- terminal -------------------------------- */
+
+if (ALLOW_SHELL) {
+  server.registerTool(
+    "run_command",
+    {
+      title: "Run a terminal command",
+      description:
+        "Runs a shell command and returns stdout, stderr and the exit code. " +
+        `Shell: ${SHELL_MODE} ` +
+        (process.platform === "win32" && SHELL_MODE === "powershell"
+          ? "(Windows PowerShell 5.1; use PowerShell syntax, e.g. `Get-ChildItem` or `dir`). "
+          : "(commands are joined with shell operators as usual). ") +
+        "The working folder must be inside the allowed root. " +
+        "Commands run with the rights of the current user and are not sandboxed, " +
+        "so destructive commands really delete things. " +
+        "Prefer file tools (read_file, edit_file, write_file) for editing files: " +
+        "they create backups and support undo. " +
+        `Default timeout is ${SHELL_TIMEOUT_DEFAULT / 1000} s.`,
+      inputSchema: {
+        command: z
+          .string()
+          .min(1)
+          .describe("Command line, e.g. `npm test` or `git status`"),
+        cwd: z
+          .string()
+          .default(".")
+          .describe("Working folder (relative to the root, or absolute inside it)"),
+        timeout_ms: z
+          .number()
+          .int()
+          .min(100)
+          .max(SHELL_TIMEOUT_MAX)
+          .default(SHELL_TIMEOUT_DEFAULT)
+          .describe(
+            `Kill the command after this many milliseconds (max ${SHELL_TIMEOUT_MAX})`,
+          ),
+      },
+    },
+    async ({ command, cwd, timeout_ms }) => {
+      try {
+        if (!command.trim()) throw new Error("The command is empty.");
+        if (command.includes("\u0000")) throw new Error("The command contains a NUL byte.");
+
+        const absCwd = resolvePath(cwd);
+        const stat = await statOrNull(absCwd);
+        if (!stat) throw new Error(`Folder not found: ${absCwd}`);
+        if (!stat.isDirectory()) throw new Error(`Not a folder: ${absCwd}`);
+
+        const result = await runCommand(command, absCwd, timeout_ms);
+        await logCommand(result);
+
+        if (result.spawnError) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Error: could not start the command: ${result.spawnError.message}`,
+              },
+            ],
+          };
+        }
+
+        return text(formatCommandResult(result));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                   Startup                                 */
 /* -------------------------------------------------------------------------- */
@@ -1512,6 +1815,11 @@ async function main() {
   if (ALLOW_OUTSIDE) {
     console.error(
       "[claude-file-manager] MCP_ALLOW_OUTSIDE_ROOT=1 — paths outside the root are allowed.",
+    );
+  }
+  if (ALLOW_SHELL) {
+    console.error(
+      `[claude-file-manager] MCP_ALLOW_SHELL=1 — the run_command terminal tool is enabled (shell: ${SHELL_MODE}).`,
     );
   }
 }

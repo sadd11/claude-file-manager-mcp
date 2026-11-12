@@ -2,7 +2,7 @@
 ; Built by installer/build.mjs.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.0"
+  #define MyAppVersion "1.2.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "build\app"

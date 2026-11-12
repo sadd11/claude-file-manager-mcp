@@ -56,6 +56,28 @@ Just write to Claude in plain language, for example:
   • "Undo the last two changes."
 
 
+Optional: terminal commands
+---------------------------
+The setup UI has a switch: "Allow terminal commands (run_command)". It is
+off by default, so Claude can only work with files.
+
+If you turn it on, Claude can also run shell commands in the chosen folder,
+for example "npm test", "git status" or a build script. After changing the
+switch, click "Connect to Claude Desktop" again and restart Claude Desktop.
+
+Important:
+• Commands run with your user rights and are not sandboxed. There is no
+  trash and no undo for them — a delete command really deletes.
+• On Windows the shell is PowerShell. Use PowerShell syntax,
+  e.g. "Get-ChildItem" or "dir".
+• The working folder must stay inside the chosen folder.
+• Every command is written to .mcp\commands.log inside the chosen folder.
+• Commands are stopped after 30 seconds by default. Claude can request a
+  longer timeout, up to 5 minutes.
+
+Leave the switch off if you only need file operations.
+
+
 Safety
 ------
 • Claude can only work inside the chosen folder.
@@ -64,6 +86,7 @@ Safety
 • A backup is saved before a file is changed; ask Claude to
   "undo the last change" to bring it back.
 • Permanent deletion only happens when explicitly requested.
+• Shell commands are disabled by default (see the terminal section above).
 • The UI is reachable only on this computer.
 
 To let Claude access the whole file system, enable "Allow access to the

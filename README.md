@@ -1,7 +1,7 @@
 # Claude File Manager MCP
 
 An MCP server for Claude that can create, read, edit, copy, move and delete
-files and folders.
+files and folders — and, optionally, run terminal commands.
 
 It runs locally over `stdio`, without internet access or third-party services.
 
@@ -25,10 +25,14 @@ It runs locally over `stdio`, without internet access or third-party services.
 | `list_trash`       | Shows the trash                                          |
 | `restore_path`     | Restores a file/folder from the trash                    |
 | `undo_last_change` | Undoes the last change (up to 20 steps)                  |
+| `run_command`      | Runs a terminal command (optional, off by default)       |
+
+The terminal tool is disabled unless `MCP_ALLOW_SHELL=1` is set. All other
+tools work with files only.
 
 ## Windows installation (prebuilt installer)
 
-Download **[ClaudeFileManager-Setup-1.1.0.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
+Download **[ClaudeFileManager-Setup-1.2.0.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
 
 1. Run the installer. If Windows shows the blue SmartScreen window, click
    **More info → Run anyway** (the file has no digital signature).
@@ -43,7 +47,7 @@ Download **[ClaudeFileManager-Setup-1.1.0.exe](https://github.com/sadd11/claude-
 "Claude File Manager" shortcuts appear in the Start menu and (optionally) on
 the desktop. Uninstall via **Settings → Apps**.
 
-**Portable version:** **[ClaudeFileManager-Portable-1.1.0.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
+**Portable version:** **[ClaudeFileManager-Portable-1.2.0.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
 extract anywhere and run `start-ui.cmd`. No installation required.
 
 ### Building the installer
@@ -88,6 +92,7 @@ The UI also provides:
 - a "Connected to Claude Desktop" indicator that shows which folder is used;
 - a list of recent folders;
 - an **Open** button that reveals the selected folder in Explorer;
+- an "Allow terminal commands" switch (see below);
 - the JSON config and a ready-made Claude Code command.
 
 The UI creates (or carefully updates) `%APPDATA%\Claude\claude_desktop_config.json`,
@@ -133,6 +138,7 @@ must be written to stdout. Stop it with `Ctrl+C`.
 
 > `MCP_FILE_ROOT` is the folder the server is allowed to work in. Point it at
 > your project so Claude cannot accidentally change something elsewhere.
+> Add `"MCP_ALLOW_SHELL": "1"` to `env` to enable the optional terminal tool.
 
 ## Connecting to Claude Code (CLI)
 
@@ -157,7 +163,8 @@ The server creates a service directory `.mcp` inside the working folder:
 ├─ trash/       deleted files and folders
 ├─ backups/     copies saved before edits
 ├─ trash.json   trash index
-└─ activity.json change history
+├─ activity.json change history
+└─ commands.log terminal command log (if the terminal is enabled)
 ```
 
 - `delete_path` by default **does not destroy** the file; it moves it to the
@@ -169,6 +176,47 @@ The server creates a service directory `.mcp` inside the working folder:
 
 > If your project is under git, add `.mcp/` to its `.gitignore`.
 
+## Terminal tool (optional)
+
+`run_command` lets Claude run a shell command in the chosen folder — for
+example `npm test`, `git status` or a build script. It is **off by default**
+so that a plain installation stays file-only.
+
+Enable it in one of these ways:
+
+- tick **Allow terminal commands (run_command)** in the setup UI and click
+  **Connect to Claude Desktop** again;
+- add `"MCP_ALLOW_SHELL": "1"` to the `env` block of the `files` server in
+  the Claude Desktop config;
+- pass `--env MCP_ALLOW_SHELL=1` to `claude mcp add`.
+
+What it does:
+
+- runs in the same allowed folder as the file tools (outside folders are
+  rejected unless `MCP_ALLOW_OUTSIDE_ROOT=1`);
+- returns stdout, stderr and the exit code;
+- stops the command after the timeout (default 30 s, maximum 300 s) and
+  kills the whole process tree;
+- appends one JSON line per command to `.mcp/commands.log`.
+
+On Windows the default shell is **Windows PowerShell** (`powershell.exe`).
+The command is passed as a UTF-16LE `-EncodedCommand`, so Cyrillic and other
+non-ASCII text works in arguments and output. Use PowerShell syntax:
+`Get-ChildItem`, `Get-Content`, `$env:NAME`, and so on.
+
+| `MCP_SHELL` | Shell                                             |
+| ----------- | ------------------------------------------------- |
+| `powershell`| `powershell.exe` (default on Windows)             |
+| `pwsh`      | PowerShell 7                                      |
+| `cmd`       | `cmd.exe` (legacy, non-ASCII text may break)      |
+| `sh`        | `/bin/sh` (default on macOS/Linux)                |
+| `bash`      | `bash` (macOS/Linux)                              |
+
+The terminal is **not a sandbox**. Commands run with your user rights and
+every side effect is real — `rm`, `git reset --hard` and similar commands do
+what they say, and the file tools' trash and undo do not cover them. Leave
+the switch off unless you need it, and read a command before you approve it.
+
 ## Example prompts
 
 - "Find all `*.tsx` files in `src`."
@@ -176,6 +224,8 @@ The server creates a service directory `.mcp` inside the working folder:
 - "In `config.js` replace `port: 3000` with `port: 8080` and `debug: false`
   with `debug: true` — do it in one action."
 - "Delete `temp.log`." → the file goes to the trash.
+- "Run `npm test` and show me the failures." (terminal enabled)
+- "Run `git status` in this folder." (terminal enabled)
 - "Restore the last deletion." / "Undo the last two changes."
 - "Show the trash."
 - "Create `docs/api.md` and describe the endpoints from `src/routes`."
@@ -186,6 +236,9 @@ The server creates a service directory `.mcp` inside the working folder:
 | ------------------------ | ------------------ | ---------------------------------------------------- |
 | `MCP_FILE_ROOT`          | current directory  | Root folder inside which operations are allowed      |
 | `MCP_ALLOW_OUTSIDE_ROOT` | `0`                | `1` — allow arbitrary paths (use with care!)         |
+| `MCP_ALLOW_SHELL`        | `0`                | `1` — register the `run_command` terminal tool       |
+| `MCP_SHELL`              | `powershell` / `sh`| Shell used by `run_command` (`cmd`, `pwsh`, `bash`)  |
+| `MCP_MAX_OUTPUT_CHARS`   | `200000`           | stdout/stderr capture limit per command              |
 | `MCP_MAX_READ_CHARS`     | `400000`           | Character limit when reading a file                  |
 | `MCP_MAX_LIST_ENTRIES`   | `5000`             | Entry limit when listing                             |
 | `MCP_DATA_DIR`           | `<root>/.mcp`      | Where to store trash, backups and history            |
@@ -200,7 +253,10 @@ The server creates a service directory `.mcp` inside the working folder:
 - Overwriting or copying onto an existing file requires `overwrite=true`.
 - The service folder `.mcp` is protected from changes through the tools.
 - Deletion is reversible by default: the file goes to the trash.
-- The server never runs shell commands — file operations only.
+- The server never runs shell commands unless `MCP_ALLOW_SHELL=1` is set.
+  When enabled, commands run with your user rights, are limited to the chosen
+  folder, are logged to `.mcp/commands.log`, and are not covered by trash or
+  undo.
 - The UI listens on `127.0.0.1` only and requires a random token in the URL,
   so other devices and websites cannot control it.
 
