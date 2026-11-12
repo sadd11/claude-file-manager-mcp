@@ -1,7 +1,8 @@
 # Claude File Manager MCP
 
 An MCP server for Claude that can create, read, edit, copy, move and delete
-files and folders — and, optionally, run terminal commands.
+files and folders — plus images, bulk replacements, ZIP archives, a compact
+project tree, and an optional terminal with background processes.
 
 It runs locally over `stdio`, without internet access or third-party services.
 
@@ -9,30 +10,41 @@ It runs locally over `stdio`, without internet access or third-party services.
 
 | Tool               | What it does                                             |
 | ------------------ | -------------------------------------------------------- |
+| `list_roots`       | Shows the allowed folders (one or several)               |
 | `list_directory`   | Lists folder contents (optionally recursive)             |
+| `list_tree`        | Draws a compact project tree                             |
 | `read_file`        | Reads a text file, optionally a line range               |
+| `read_image`       | Shows a PNG/JPEG/GIF/WebP image to Claude                |
 | `write_file`       | Creates or overwrites a file                             |
 | `append_file`      | Appends text to the end of a file                        |
 | `edit_file`        | Replaces an exact fragment and shows a diff              |
 | `multi_edit`       | Several replacements in one call, atomically             |
+| `replace_in_files` | Replaces text across many files, with one undo step      |
 | `create_directory` | Creates a folder with all missing parents                |
 | `move_path`        | Moves or renames a file/folder                           |
 | `copy_path`        | Copies a file or folder                                  |
+| `zip_path`         | Packs files and folders into a ZIP archive               |
+| `unzip_path`       | Extracts a ZIP archive into a folder                     |
 | `delete_path`      | Moves to trash (or permanently with `permanent=true`)    |
 | `file_info`        | Shows type, size and dates of a file/folder              |
 | `find_files`       | Finds files by glob or name substring                    |
-| `search_content`   | Searches text/regex inside files                         |
+| `search_content`   | Searches text/regex, with context lines or a file list   |
 | `list_trash`       | Shows the trash                                          |
 | `restore_path`     | Restores a file/folder from the trash                    |
 | `undo_last_change` | Undoes the last change (up to 20 steps)                  |
 | `run_command`      | Runs a terminal command (optional, off by default)       |
+| `start_process`    | Starts a background command (optional, off by default)   |
+| `read_output`      | Reads the output of a background process                 |
+| `stop_process`     | Stops a background process and its children             |
+| `list_processes`   | Lists background processes of this session              |
 
-The terminal tool is disabled unless `MCP_ALLOW_SHELL=1` is set. All other
-tools work with files only.
+That is 27 tools with the terminal enabled and 22 without. The five terminal
+tools are disabled unless `MCP_ALLOW_SHELL=1` is set. All other tools work with
+files only.
 
 ## Windows installation (prebuilt installer)
 
-Download **[ClaudeFileManager-Setup-1.2.0.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
+Download **[ClaudeFileManager-Setup-1.3.0.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
 
 1. Run the installer. If Windows shows the blue SmartScreen window, click
    **More info → Run anyway** (the file has no digital signature).
@@ -47,7 +59,7 @@ Download **[ClaudeFileManager-Setup-1.2.0.exe](https://github.com/sadd11/claude-
 "Claude File Manager" shortcuts appear in the Start menu and (optionally) on
 the desktop. Uninstall via **Settings → Apps**.
 
-**Portable version:** **[ClaudeFileManager-Portable-1.2.0.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
+**Portable version:** **[ClaudeFileManager-Portable-1.3.0.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
 extract anywhere and run `start-ui.cmd`. No installation required.
 
 ### Building the installer
@@ -82,15 +94,20 @@ The page `http://127.0.0.1:4317` opens:
 1. Choose a folder — browse drives and subfolders, paste a path manually, or
    click **Browse…** and pick a folder in the system dialog.
 2. Click **Use this folder**.
-3. Click **Connect to Claude Desktop**.
-4. Fully close and reopen Claude Desktop.
+3. Optionally add more folders under **Additional folders** — Claude can then
+   work in all of them, and can choose the right one itself.
+4. Click **Connect to Claude Desktop**.
+5. Fully close and reopen Claude Desktop.
 
 The UI also provides:
 
 - **Check server** — actually starts the MCP server and lists the working
   tools;
-- a "Connected to Claude Desktop" indicator that shows which folder is used;
+- a "Connected to Claude Desktop" indicator that shows which folders are used;
 - a list of recent folders;
+- a **History and recovery** section with Trash, Backups, Commands and
+  Activity tabs — deleted items and file versions can be restored with one
+  click, without writing a prompt;
 - an **Open** button that reveals the selected folder in Explorer;
 - an "Allow terminal commands" switch (see below);
 - the JSON config and a ready-made Claude Code command.
@@ -138,7 +155,10 @@ must be written to stdout. Stop it with `Ctrl+C`.
 
 > `MCP_FILE_ROOT` is the folder the server is allowed to work in. Point it at
 > your project so Claude cannot accidentally change something elsewhere.
-> Add `"MCP_ALLOW_SHELL": "1"` to `env` to enable the optional terminal tool.
+> To allow several folders, use `MCP_FILE_ROOTS` instead with paths separated
+> by `;` (Windows) or `:` (macOS/Linux). Relative paths resolve against the
+> first folder. Add `"MCP_ALLOW_SHELL": "1"` to `env` to enable the optional
+> terminal tools.
 
 ## Connecting to Claude Code (CLI)
 
@@ -167,12 +187,21 @@ The server creates a service directory `.mcp` inside the working folder:
 └─ commands.log terminal command log (if the terminal is enabled)
 ```
 
+The service folder lives in the first allowed folder. With several roots,
+trash, backups and history are still stored there.
+
 - `delete_path` by default **does not destroy** the file; it moves it to the
   trash. Restore it with `restore_path` or `undo_last_change`.
 - `edit_file`, `multi_edit`, `write_file` and `append_file` save a copy of the
   old version before modifying.
+- `replace_in_files` backs up every changed file and records a single undo
+  step, so one `undo_last_change` reverts the whole bulk replacement.
+- `zip_path` and `unzip_path` can be undone when they create a new path.
 - `undo_last_change` reverts the last action; several steps can be undone.
 - Permanent deletion happens only with `permanent=true`.
+- The setup UI shows the same trash, backups, commands and activity, with
+  **Restore** buttons. A backup restore first saves the current version as a
+  new backup, so it can be undone too.
 
 > If your project is under git, add `.mcp/` to its `.gitignore`.
 
@@ -212,6 +241,22 @@ non-ASCII text works in arguments and output. Use PowerShell syntax:
 | `sh`        | `/bin/sh` (default on macOS/Linux)                |
 | `bash`      | `bash` (macOS/Linux)                              |
 
+### Background processes
+
+For dev servers, watchers and long builds there are four more tools, enabled
+by the same switch:
+
+- `start_process` starts a command in the background and returns an id;
+- `read_output` returns what it has printed so far, can wait for it to finish
+  and can clear the buffer;
+- `stop_process` stops it and the whole process tree;
+- `list_processes` lists the processes of this session.
+
+Up to 8 processes can run at once (`MCP_MAX_PROCESSES`), each keeps at most
+100000 characters of stdout and stderr (`MCP_MAX_PROCESS_BUFFER`), and all of
+them are stopped when the server exits. Starts and exits are also written to
+`.mcp/commands.log`.
+
 The terminal is **not a sandbox**. Commands run with your user rights and
 every side effect is real — `rm`, `git reset --hard` and similar commands do
 what they say, and the file tools' trash and undo do not cover them. Leave
@@ -220,11 +265,16 @@ the switch off unless you need it, and read a command before you approve it.
 ## Example prompts
 
 - "Find all `*.tsx` files in `src`."
-- "Find where `MCP_FILE_ROOT` is used and show the lines."
+- "Show me the project tree two levels deep."
+- "Look at `design/mockup.png` and build the same layout."
+- "Find where `MCP_FILE_ROOT` is used and show two lines of context."
 - "In `config.js` replace `port: 3000` with `port: 8080` and `debug: false`
   with `debug: true` — do it in one action."
+- "Replace `oldName` with `newName` in every `.js` file under `src`."
+- "Zip `src` and `README.md` into `release.zip`."
 - "Delete `temp.log`." → the file goes to the trash.
 - "Run `npm test` and show me the failures." (terminal enabled)
+- "Start `npm run dev` in the background and show its output." (terminal enabled)
 - "Run `git status` in this folder." (terminal enabled)
 - "Restore the last deletion." / "Undo the last two changes."
 - "Show the trash."
@@ -235,28 +285,35 @@ the switch off unless you need it, and read a command before you approve it.
 | Variable                 | Default            | Description                                          |
 | ------------------------ | ------------------ | ---------------------------------------------------- |
 | `MCP_FILE_ROOT`          | current directory  | Root folder inside which operations are allowed      |
+| `MCP_FILE_ROOTS`         | —                  | Several allowed folders separated by `;` / `:`       |
 | `MCP_ALLOW_OUTSIDE_ROOT` | `0`                | `1` — allow arbitrary paths (use with care!)         |
-| `MCP_ALLOW_SHELL`        | `0`                | `1` — register the `run_command` terminal tool       |
+| `MCP_ALLOW_SHELL`        | `0`                | `1` — register the terminal and background tools     |
 | `MCP_SHELL`              | `powershell` / `sh`| Shell used by `run_command` (`cmd`, `pwsh`, `bash`)  |
 | `MCP_MAX_OUTPUT_CHARS`   | `200000`           | stdout/stderr capture limit per command              |
 | `MCP_MAX_READ_CHARS`     | `400000`           | Character limit when reading a file                  |
 | `MCP_MAX_LIST_ENTRIES`   | `5000`             | Entry limit when listing                             |
+| `MCP_MAX_IMAGE_BYTES`    | `5000000`          | Largest image `read_image` will return               |
+| `MCP_MAX_PROCESSES`      | `8`                | Maximum number of background processes               |
+| `MCP_MAX_PROCESS_BUFFER` | `100000`           | Buffered output characters per background process    |
+| `MCP_MAX_ARCHIVE_BYTES`  | `500000000`        | Size limit for ZIP sources and extraction            |
 | `MCP_DATA_DIR`           | `<root>/.mcp`      | Where to store trash, backups and history            |
 | `UI_PORT`                | `4317`             | Local UI port (`npm run ui`)                         |
 | `UI_NO_OPEN`             | —                  | `1` — do not open the browser automatically          |
 
 ## Security
 
-- All paths are normalized; escaping `MCP_FILE_ROOT` is blocked.
-- The root folder cannot be deleted, moved or overwritten.
+- All paths are normalized; escaping every allowed folder is blocked.
+- Root folders cannot be deleted, moved or overwritten.
 - A non-empty folder can only be deleted with `recursive=true`.
 - Overwriting or copying onto an existing file requires `overwrite=true`.
 - The service folder `.mcp` is protected from changes through the tools.
 - Deletion is reversible by default: the file goes to the trash.
+- Archives are extracted inside the destination only; paths that try to
+  escape it are rejected, ZIP64 and encrypted archives are not supported.
 - The server never runs shell commands unless `MCP_ALLOW_SHELL=1` is set.
-  When enabled, commands run with your user rights, are limited to the chosen
-  folder, are logged to `.mcp/commands.log`, and are not covered by trash or
-  undo.
+  When enabled, commands run with your user rights, are limited to the allowed
+  folders, are logged to `.mcp/commands.log`, and are not covered by trash or
+  undo. Background processes are capped and stopped when the server exits.
 - The UI listens on `127.0.0.1` only and requires a random token in the URL,
   so other devices and websites cannot control it.
 

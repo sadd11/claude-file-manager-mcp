@@ -4,8 +4,8 @@ CLAUDE FILE MANAGER — GETTING STARTED
 What this is
 ------------
 A local MCP server for Claude Desktop. It lets Claude create, read, edit,
-search, copy, move and delete files and folders — but only inside the
-folder you choose.
+search, copy, move, zip and delete files and folders — and look at images.
+All operations are limited to the folders you choose.
 
 Everything runs on your computer. No internet is required and no data is
 sent anywhere.
@@ -30,10 +30,25 @@ In the browser:
 1. Choose a folder — browse drives and subfolders, paste a path manually,
    or click "Browse…" and pick a folder in the system dialog.
 2. Click "Use this folder".
-3. Click "Connect to Claude Desktop".
+3. Optionally add more folders in the "Additional folders" block. Claude can
+   then work in all of them.
+4. Click "Connect to Claude Desktop".
 
 The server writes the settings into the Claude Desktop config and creates
 a backup of the old config. You do not need to edit anything manually.
+
+
+History and recovery
+--------------------
+The setup page has a "History and recovery" section:
+
+  • Trash     — deleted files and folders; click "Restore" to bring one back
+  • Backups   — copies saved before Claude edited a file; "Restore" reverts it
+  • Commands  — terminal commands and background processes
+  • Activity  — what the server changed, newest first
+
+Restoring a backup saves the current version first, so that action can also
+be undone.
 
 
 Step 3. Restart Claude Desktop
@@ -47,10 +62,14 @@ How to use it
 Just write to Claude in plain language, for example:
 
   • "Show the contents of the current folder."
+  • "Show the project tree two levels deep."
+  • "Look at design/mockup.png and build the same layout."
   • "Find all *.tsx files in src."
-  • "Where is MCP_FILE_ROOT used?"
+  • "Where is MCP_FILE_ROOT used? Show two lines of context."
   • "Create docs/api.md and describe the endpoints from src/routes."
   • "In config.js replace port: 3000 with 8080."
+  • "Replace oldName with newName in every .js file under src."
+  • "Zip src and README.md into release.zip."
   • "Delete temp.log."        — the file goes to the trash
   • "Restore the last deletion."
   • "Undo the last two changes."
@@ -65,27 +84,35 @@ If you turn it on, Claude can also run shell commands in the chosen folder,
 for example "npm test", "git status" or a build script. After changing the
 switch, click "Connect to Claude Desktop" again and restart Claude Desktop.
 
+It can also start long-running commands in the background — dev servers,
+watchers and builds — read their output and stop them. At most 8 background
+processes run at once, and all are stopped when the server exits.
+
 Important:
 • Commands run with your user rights and are not sandboxed. There is no
   trash and no undo for them — a delete command really deletes.
 • On Windows the shell is PowerShell. Use PowerShell syntax,
   e.g. "Get-ChildItem" or "dir".
-• The working folder must stay inside the chosen folder.
+• Commands must stay inside the chosen folders.
 • Every command is written to .mcp\commands.log inside the chosen folder.
 • Commands are stopped after 30 seconds by default. Claude can request a
-  longer timeout, up to 5 minutes.
+  longer timeout, up to 5 minutes (that limit does not apply to background
+  processes, which run until stopped).
 
 Leave the switch off if you only need file operations.
 
 
 Safety
 ------
-• Claude can only work inside the chosen folder.
+• Claude can only work inside the folders you chose.
 • Deletion is reversible by default: files go to the trash at
-  <chosen folder>\.mcp\trash.
+  <first folder>\.mcp\trash.
 • A backup is saved before a file is changed; ask Claude to
-  "undo the last change" to bring it back.
+  "undo the last change" to bring it back, or use the History section
+  in the setup page.
 • Permanent deletion only happens when explicitly requested.
+• ZIP archives are extracted only inside the destination folder; unsafe
+  archive paths are rejected.
 • Shell commands are disabled by default (see the terminal section above).
 • The UI is reachable only on this computer.
 
@@ -122,7 +149,7 @@ Where things live
 Install folder:
     %LOCALAPPDATA%\ClaudeFileManager
 
-Trash and backups (inside the chosen folder):
+Trash and backups (inside the first chosen folder):
     .mcp\
 
 Claude Desktop config:

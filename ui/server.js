@@ -49,7 +49,78 @@ const MIME = {
 /* -------------------------------------------------------------------------- */
 
 const defaultRoot = path.resolve(process.env.MCP_FILE_ROOT || PROJECT_ROOT);
-let state = { root: defaultRoot, allowOutside: false, allowShell: false, recent: [] };
+let state = {
+  root: defaultRoot,
+  extraRoots: [],
+  allowOutside: false,
+  allowShell: false,
+  recent: [],
+};
+
+function samePath(a, b) {
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function uniquePaths(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const abs = path.resolve(item);
+    const key = process.platform === "win32" ? abs.toLowerCase() : abs;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(abs);
+  }
+  return out;
+}
+
+function allRoots() {
+  return uniquePaths([state.root, ...state.extraRoots]);
+}
+
+function applyRoots(env) {
+  const roots = allRoots();
+  delete env.MCP_FILE_ROOTS;
+  delete env.MCP_FILE_ROOT;
+  if (roots.length > 1) env.MCP_FILE_ROOTS = roots.join(path.delimiter);
+  else env.MCP_FILE_ROOT = roots[0];
+  return env;
+}
+
+function dataDir() {
+  return path.join(state.root, ".mcp");
+}
+
+async function statOrNull(target) {
+  try {
+    return await fs.stat(target);
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonSafe(file, fallback) {
+  try {
+    const parsed = JSON.parse(await fs.readFile(file, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonSafe(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  // Write through a temp file and rename, the same way the MCP server does:
+  // a reader never sees a half-written JSON, even if two processes write
+  // to the same activity/trash index at once.
+  const tmp = `${file}.tmp-${crypto.randomBytes(4).toString("hex")}`;
+  await fs.writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
+  await fs.rename(tmp, file);
+}
 
 async function loadState() {
   try {
@@ -57,6 +128,13 @@ async function loadState() {
     const parsed = JSON.parse(raw);
     if (typeof parsed.root === "string" && parsed.root.trim()) {
       state.root = path.resolve(parsed.root);
+    }
+    if (Array.isArray(parsed.extraRoots)) {
+      state.extraRoots = uniquePaths(
+        parsed.extraRoots
+          .filter((item) => typeof item === "string" && item.trim())
+          .map((item) => path.resolve(item)),
+      ).filter((item) => !samePath(item, state.root));
     }
     state.allowOutside = Boolean(parsed.allowOutside);
     state.allowShell = Boolean(parsed.allowShell);
@@ -108,7 +186,7 @@ function desktopConfigPath() {
 }
 
 function buildServerEntry() {
-  const env = { MCP_FILE_ROOT: state.root };
+  const env = applyRoots({});
   if (state.allowOutside) env.MCP_ALLOW_OUTSIDE_ROOT = "1";
   if (state.allowShell) env.MCP_ALLOW_SHELL = "1";
   return { command: NODE_BIN, args: [SERVER_ENTRY], env };
@@ -120,11 +198,13 @@ function buildConfigObject() {
 
 function buildCodeCommand() {
   const q = (s) => `"${s.replace(/"/g, '\\"')}"`;
-  const parts = [
-    "claude mcp add files",
-    "--scope user",
-    `--env MCP_FILE_ROOT=${q(state.root)}`,
-  ];
+  const parts = ["claude mcp add files", "--scope user"];
+  const roots = allRoots();
+  if (roots.length > 1) {
+    parts.push(`--env MCP_FILE_ROOTS=${q(roots.join(path.delimiter))}`);
+  } else {
+    parts.push(`--env MCP_FILE_ROOT=${q(roots[0])}`);
+  }
   if (state.allowOutside) parts.push("--env MCP_ALLOW_OUTSIDE_ROOT=1");
   if (state.allowShell) parts.push("--env MCP_ALLOW_SHELL=1");
   parts.push("--", q(NODE_BIN), q(SERVER_ENTRY));
@@ -189,19 +269,35 @@ async function configStatus() {
   try {
     const config = JSON.parse(await fs.readFile(file, "utf8"));
     const entry = config?.mcpServers?.files;
+    const raw = entry?.env?.MCP_FILE_ROOTS;
+    const configuredRoots = raw
+      ? String(raw)
+          .split(path.delimiter)
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .map((item) => path.resolve(item))
+      : entry?.env?.MCP_FILE_ROOT
+        ? [path.resolve(entry.env.MCP_FILE_ROOT)]
+        : [];
     return {
       configured: Boolean(entry),
-      configuredRoot: entry?.env?.MCP_FILE_ROOT || null,
+      configuredRoot: configuredRoots[0] || null,
+      configuredRoots,
       configPath: file,
     };
   } catch {
-    return { configured: false, configuredRoot: null, configPath: file };
+    return {
+      configured: false,
+      configuredRoot: null,
+      configuredRoots: [],
+      configPath: file,
+    };
   }
 }
 
 function checkServer() {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env, MCP_FILE_ROOT: state.root };
+    const env = applyRoots({ ...process.env });
     if (state.allowOutside) env.MCP_ALLOW_OUTSIDE_ROOT = "1";
     if (state.allowShell) env.MCP_ALLOW_SHELL = "1";
     delete env.MCP_DATA_DIR;
@@ -500,6 +596,339 @@ async function browse(inputPath) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                                   History                                  */
+/* -------------------------------------------------------------------------- */
+
+async function moveItem(source, destination) {
+  try {
+    await fs.rename(source, destination);
+  } catch (e) {
+    if (e.code !== "EXDEV") throw e;
+    await fs.cp(source, destination, { recursive: true });
+    await fs.rm(source, { recursive: true, force: true });
+  }
+}
+
+async function readActivityItems() {
+  const log = await readJsonSafe(path.join(dataDir(), "activity.json"), { items: [] });
+  return Array.isArray(log.items) ? log.items : [];
+}
+
+async function recordUiActivity(kind, description, undo) {
+  const items = await readActivityItems();
+  items.push({ at: new Date().toISOString(), kind, description, undo: undo || null });
+  await writeJsonSafe(path.join(dataDir(), "activity.json"), {
+    items: items.slice(-100),
+  });
+}
+
+/** Maps backup file paths to the file they belong to, using the activity log. */
+async function backupTargets() {
+  const map = new Map();
+  for (const entry of await readActivityItems()) {
+    const undo = entry.undo;
+    if (!undo) continue;
+    if (undo.kind === "restore_file" && undo.backup && undo.target) {
+      map.set(path.resolve(undo.backup), undo.target);
+    }
+    if (undo.kind === "restore_files" && Array.isArray(undo.items)) {
+      for (const item of undo.items) {
+        if (item?.backup && item?.target) {
+          map.set(path.resolve(item.backup), item.target);
+        }
+      }
+    }
+  }
+  return map;
+}
+
+async function readBackups() {
+  const dir = path.join(dataDir(), "backups");
+  const targets = await backupTargets();
+  let names = [];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+
+  const items = [];
+  for (const name of names) {
+    const abs = path.join(dir, name);
+    const stat = await statOrNull(abs);
+    if (!stat?.isFile()) continue;
+    items.push({
+      name,
+      path: abs,
+      size: stat.size,
+      modified: stat.mtime.toISOString(),
+      target: targets.get(path.resolve(abs)) || null,
+    });
+  }
+  return items.sort((a, b) => b.modified.localeCompare(a.modified));
+}
+
+async function readTrash() {
+  const index = await readJsonSafe(path.join(dataDir(), "trash.json"), { items: [] });
+  const items = Array.isArray(index.items) ? index.items : [];
+  const result = [];
+  for (const item of items.slice().reverse()) {
+    result.push({
+      id: item.id,
+      originalPath: item.originalPath,
+      type: item.type === "directory" ? "folder" : "file",
+      deletedAt: item.deletedAt,
+      exists: Boolean(await statOrNull(item.trashPath)),
+    });
+  }
+  return result;
+}
+
+async function readCommands() {
+  let raw = "";
+  try {
+    raw = await fs.readFile(path.join(dataDir(), "commands.log"), "utf8");
+  } catch {
+    return [];
+  }
+  const items = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object") items.push(parsed);
+    } catch {
+      /* ignore malformed lines */
+    }
+  }
+  return items.slice(-200).reverse();
+}
+
+async function buildHistory() {
+  return {
+    dataDir: dataDir(),
+    roots: allRoots(),
+    trash: await readTrash(),
+    backups: await readBackups(),
+    commands: await readCommands(),
+    activity: (await readActivityItems()).slice().reverse(),
+  };
+}
+
+function isInsideAllowed(target) {
+  if (state.allowOutside) return true;
+  for (const root of allRoots()) {
+    const rel = path.relative(root, target);
+    if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return true;
+  }
+  return false;
+}
+
+async function restoreTrash(id, overwrite) {
+  const file = path.join(dataDir(), "trash.json");
+  const index = await readJsonSafe(file, { items: [] });
+  const items = Array.isArray(index.items) ? index.items : [];
+  const item = items.find((entry) => entry.id === id);
+  if (!item) throw new Error(`No trash entry with id "${id}".`);
+  if (!(await statOrNull(item.trashPath))) {
+    throw new Error("The deleted item is no longer in the trash folder.");
+  }
+  if (!isInsideAllowed(item.originalPath)) {
+    throw new Error(`The original path is outside the allowed folders: ${item.originalPath}`);
+  }
+
+  if (await statOrNull(item.originalPath)) {
+    if (!overwrite) {
+      throw new Error(
+        `Something already exists at ${item.originalPath}. Confirm replacing it to continue.`,
+      );
+    }
+    await fs.rm(item.originalPath, { recursive: true, force: true });
+  }
+
+  await fs.mkdir(path.dirname(item.originalPath), { recursive: true });
+  await moveItem(item.trashPath, item.originalPath);
+
+  index.items = items.filter((entry) => entry.id !== id);
+  await writeJsonSafe(file, index);
+
+  await recordUiActivity("restore", `Restore ${item.originalPath}`, {
+    kind: "remove",
+    target: item.originalPath,
+  });
+
+  return item;
+}
+
+async function restoreBackup(name) {
+  const dir = path.join(dataDir(), "backups");
+  const safeName = path.basename(String(name || ""));
+  if (!safeName) throw new Error("Backup name is required.");
+
+  const source = path.resolve(dir, safeName);
+  if (path.dirname(source) !== path.resolve(dir)) {
+    throw new Error("Invalid backup name.");
+  }
+  if (!(await statOrNull(source))) {
+    throw new Error(`Backup not found: ${safeName}`);
+  }
+
+  const target = (await backupTargets()).get(source);
+  if (!target) {
+    throw new Error(
+      "This backup is not linked to a file in the activity log. " +
+        "Use undo_last_change in Claude instead.",
+    );
+  }
+  if (!isInsideAllowed(target)) {
+    throw new Error(`The target path is outside the allowed folders: ${target}`);
+  }
+
+  const existed = Boolean(await statOrNull(target));
+  let undo = { kind: "remove", target };
+  if (existed) {
+    const safety = path.join(dir, `${crypto.randomUUID()}__${path.basename(target)}`);
+    await fs.copyFile(target, safety);
+    undo = { kind: "restore_file", target, backup: safety };
+  }
+
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.copyFile(source, target);
+  await fs.rm(source, { force: true });
+
+  await recordUiActivity("restore_backup", `Restore backup of ${target}`, undo);
+  return { target, backup: safeName };
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Update check                                */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Looks at the latest GitHub release of the project and compares it with the
+ * version in package.json. This is the ONLY outgoing network request of the UI
+ * (the MCP server in src/index.js never touches the network). Disable it with
+ * UI_NO_UPDATE_CHECK=1.
+ */
+const UPDATE_REPO = "sadd11/claude-file-manager-mcp";
+const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
+const UPDATE_PAGE = `https://github.com/${UPDATE_REPO}/releases`;
+const UPDATE_ENABLED = process.env.UI_NO_UPDATE_CHECK !== "1";
+const UPDATE_OK_TTL = 30 * 60_000; // GitHub allows 60 anonymous requests per hour
+const UPDATE_ERR_TTL = 2 * 60_000;
+const UPDATE_MIN_FORCE = 30_000;
+
+let updateCache = { at: 0, ttl: 0, value: null };
+
+async function localVersion() {
+  const pkg = await readJsonSafe(path.join(PROJECT_ROOT, "package.json"), {});
+  return typeof pkg.version === "string" ? pkg.version : null;
+}
+
+function parseVersion(text) {
+  const m = /^v?(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?/i.exec(
+    String(text || "").trim(),
+  );
+  if (!m) return null;
+  return { nums: [Number(m[1]), Number(m[2]), Number(m[3] || 0)], pre: m[4] || "" };
+}
+
+function formatVersion(v) {
+  return v.nums.join(".") + (v.pre ? `-${v.pre}` : "");
+}
+
+function compareVersions(a, b) {
+  for (let i = 0; i < 3; i += 1) {
+    if (a.nums[i] !== b.nums[i]) return a.nums[i] > b.nums[i] ? 1 : -1;
+  }
+  if (a.pre === b.pre) return 0;
+  if (!a.pre) return 1; // 1.4.0 is newer than 1.4.0-beta
+  if (!b.pre) return -1;
+  return a.pre > b.pre ? 1 : -1;
+}
+
+function repoUrlOrNull(value) {
+  return typeof value === "string" && value.startsWith(`https://github.com/${UPDATE_REPO}/`)
+    ? value
+    : null;
+}
+
+async function fetchLatestRelease() {
+  const res = await fetch(UPDATE_API, {
+    headers: {
+      accept: "application/vnd.github+json",
+      "user-agent": "claude-file-manager-ui",
+      "x-github-api-version": "2022-11-28",
+    },
+    signal: AbortSignal.timeout(6000),
+  });
+  if (res.status === 404) return null; // no releases published yet
+  if (res.status === 403 || res.status === 429) {
+    throw new Error("GitHub rate limit reached. Try again later.");
+  }
+  if (!res.ok) throw new Error(`GitHub answered with HTTP ${res.status}.`);
+  return res.json();
+}
+
+async function checkForUpdate({ force = false } = {}) {
+  const current = await localVersion();
+  const base = { enabled: UPDATE_ENABLED, current, releasesUrl: UPDATE_PAGE, hasUpdate: false };
+  if (!UPDATE_ENABLED) return base;
+
+  const age = Date.now() - updateCache.at;
+  if (updateCache.value && age < (force ? UPDATE_MIN_FORCE : updateCache.ttl)) {
+    return { ...updateCache.value, current };
+  }
+
+  const checkedAt = new Date().toISOString();
+  let value;
+  let ttl = UPDATE_OK_TTL;
+  try {
+    const release = await fetchLatestRelease();
+    if (!release) {
+      value = { ...base, noReleases: true, checkedAt };
+    } else {
+      const latest = parseVersion(release.tag_name);
+      const mine = parseVersion(current);
+      const assets = (Array.isArray(release.assets) ? release.assets : [])
+        .map((asset) => ({
+          name: String(asset?.name || ""),
+          size: Number(asset?.size) || 0,
+          url: repoUrlOrNull(asset?.browser_download_url),
+        }))
+        .filter((asset) => asset.name && asset.url)
+        .slice(0, 6);
+      value = {
+        ...base,
+        tag: String(release.tag_name || ""),
+        latest: latest ? formatVersion(latest) : String(release.tag_name || ""),
+        name: typeof release.name === "string" ? release.name : "",
+        url: repoUrlOrNull(release.html_url) || UPDATE_PAGE,
+        publishedAt: release.published_at || null,
+        notes: typeof release.body === "string" ? release.body.slice(0, 1500) : "",
+        assets,
+        hasUpdate: Boolean(latest && mine && compareVersions(latest, mine) > 0),
+        checkedAt,
+      };
+    }
+  } catch (e) {
+    ttl = UPDATE_ERR_TTL;
+    const message =
+      e?.name === "TimeoutError"
+        ? "GitHub did not respond in time."
+        : e?.name === "TypeError"
+          ? "Could not reach GitHub. Is the internet connection working?"
+          : e instanceof Error
+            ? e.message
+            : String(e);
+    value = { ...base, error: message, checkedAt };
+  }
+
+  updateCache = { at: Date.now(), ttl, value };
+  return value;
+}
+
+/* -------------------------------------------------------------------------- */
 /*                                    HTTP                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -556,6 +985,8 @@ async function handleApi(req, res, url) {
     const status = await configStatus();
     return sendJson(res, 200, {
       root: state.root,
+      extraRoots: state.extraRoots,
+      roots: allRoots(),
       allowOutside: state.allowOutside,
       allowShell: state.allowShell,
       recent: state.recent,
@@ -564,6 +995,7 @@ async function handleApi(req, res, url) {
       desktopExists,
       configured: status.configured,
       configuredRoot: status.configuredRoot,
+      configuredRoots: status.configuredRoots,
       projectRoot: PROJECT_ROOT,
       platform: process.platform,
     });
@@ -571,30 +1003,68 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/state" && req.method === "POST") {
     const body = await readBody(req);
-    if (body.root !== undefined) {
-      if (typeof body.root !== "string" || !body.root.trim()) {
-        return sendJson(res, 400, { error: "Path is required." });
+
+    async function validFolder(value) {
+      if (typeof value !== "string" || !value.trim()) {
+        return { error: "Path is required." };
       }
-      const abs = path.resolve(body.root.trim());
-      let stat;
-      try {
-        stat = await fs.stat(abs);
-      } catch {
-        return sendJson(res, 404, { error: `Folder not found: ${abs}` });
-      }
-      if (!stat.isDirectory()) {
-        return sendJson(res, 400, { error: `Not a folder: ${abs}` });
-      }
+      const abs = path.resolve(value.trim());
+      const stat = await statOrNull(abs);
+      if (!stat) return { status: 404, error: `Folder not found: ${abs}` };
+      if (!stat.isDirectory()) return { status: 400, error: `Not a folder: ${abs}` };
       try {
         await fs.access(abs, fsConstants.R_OK | fsConstants.W_OK);
       } catch {
-        return sendJson(res, 400, {
+        return {
+          status: 400,
           error: `No read/write permission for ${abs}. Choose another folder.`,
-        });
+        };
       }
-      state.root = abs;
-      state.recent = [abs, ...state.recent.filter((item) => item !== abs)].slice(0, 8);
+      return { abs };
     }
+
+    if (body.root !== undefined) {
+      const check = await validFolder(body.root);
+      if (check.error) return sendJson(res, check.status || 400, { error: check.error });
+      state.root = check.abs;
+      state.extraRoots = state.extraRoots.filter((item) => !samePath(item, check.abs));
+      state.recent = [check.abs, ...state.recent.filter((item) => item !== check.abs)].slice(
+        0,
+        8,
+      );
+    }
+
+    if (body.extraRoots !== undefined) {
+      if (!Array.isArray(body.extraRoots)) {
+        return sendJson(res, 400, { error: "extraRoots must be a list of folders." });
+      }
+      const next = [];
+      for (const item of body.extraRoots) {
+        const check = await validFolder(item);
+        if (check.error) return sendJson(res, check.status || 400, { error: check.error });
+        if (!samePath(check.abs, state.root)) next.push(check.abs);
+      }
+      state.extraRoots = uniquePaths(next).filter((item) => !samePath(item, state.root));
+    }
+
+    if (body.addRoot !== undefined) {
+      const check = await validFolder(body.addRoot);
+      if (check.error) return sendJson(res, check.status || 400, { error: check.error });
+      if (!samePath(check.abs, state.root)) {
+        state.extraRoots = uniquePaths([...state.extraRoots, check.abs]).filter(
+          (item) => !samePath(item, state.root),
+        );
+      }
+    }
+
+    if (body.removeRoot !== undefined) {
+      if (typeof body.removeRoot !== "string" || !body.removeRoot.trim()) {
+        return sendJson(res, 400, { error: "Path is required." });
+      }
+      const abs = path.resolve(body.removeRoot.trim());
+      state.extraRoots = state.extraRoots.filter((item) => !samePath(item, abs));
+    }
+
     if (body.allowOutside !== undefined) {
       state.allowOutside = Boolean(body.allowOutside);
     }
@@ -604,10 +1074,48 @@ async function handleApi(req, res, url) {
     await saveState();
     return sendJson(res, 200, {
       root: state.root,
+      extraRoots: state.extraRoots,
+      roots: allRoots(),
       allowOutside: state.allowOutside,
       allowShell: state.allowShell,
       recent: state.recent,
     });
+  }
+
+  if (url.pathname === "/api/update" && req.method === "GET") {
+    const force = url.searchParams.get("force") === "1";
+    return sendJson(res, 200, await checkForUpdate({ force }));
+  }
+
+  if (url.pathname === "/api/history" && req.method === "GET") {
+    return sendJson(res, 200, await buildHistory());
+  }
+
+  if (url.pathname === "/api/trash/restore" && req.method === "POST") {
+    const body = await readBody(req);
+    if (typeof body.id !== "string" || !body.id.trim()) {
+      return sendJson(res, 400, { error: "Trash entry id is required." });
+    }
+    try {
+      const item = await restoreTrash(body.id.trim(), Boolean(body.overwrite));
+      return sendJson(res, 200, { ok: true, restored: item.originalPath });
+    } catch (e) {
+      const status = /already exists/i.test(e.message) ? 409 : 404;
+      return sendJson(res, status, { error: e.message });
+    }
+  }
+
+  if (url.pathname === "/api/backup/restore" && req.method === "POST") {
+    const body = await readBody(req);
+    if (typeof body.name !== "string" || !body.name.trim()) {
+      return sendJson(res, 400, { error: "Backup name is required." });
+    }
+    try {
+      const result = await restoreBackup(body.name.trim());
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return sendJson(res, 400, { error: e.message });
+    }
   }
 
   if (url.pathname === "/api/browse" && req.method === "GET") {
@@ -765,6 +1273,17 @@ async function main() {
   console.log("");
 
   if (!process.env.UI_NO_OPEN) openBrowser(url);
+
+  if (UPDATE_ENABLED) {
+    checkForUpdate()
+      .then((info) => {
+        if (!info.hasUpdate) return;
+        console.log(`  Update available: ${info.current} -> ${info.latest}`);
+        console.log(`  ${info.url}`);
+        console.log("");
+      })
+      .catch(() => {});
+  }
 }
 
 main().catch((e) => {

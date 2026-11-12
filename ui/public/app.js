@@ -10,6 +10,9 @@ let current = null;
 let toastTimer = null;
 let savedRoot = "";
 let recentList = [];
+let extraRoots = [];
+let history = null;
+let activeTab = "trash";
 
 async function api(path, options = {}) {
   const headers = { "x-auth-token": token, ...(options.headers || {}) };
@@ -178,26 +181,273 @@ function renderRecent(recent, activePath) {
   }
 }
 
+function sameFolder(a, b) {
+  if (!a || !b) return false;
+  return a.replace(/[\\/]+$/, "").toLowerCase() ===
+    b.replace(/[\\/]+$/, "").toLowerCase();
+}
+
 function updateConnStatus(state) {
   const el = $("connStatus");
   const text = $("connText");
 
-  const sameRoot =
-    state.configuredRoot &&
-    state.configuredRoot.toLowerCase() === String(state.root).toLowerCase();
-  const otherRoot = state.configured && !sameRoot;
+  const roots = state.roots && state.roots.length ? state.roots : [state.root];
+  const configured = state.configuredRoots && state.configuredRoots.length
+    ? state.configuredRoots
+    : state.configuredRoot
+      ? [state.configuredRoot]
+      : [];
+  const sameRoots =
+    configured.length === roots.length &&
+    configured.every((item, index) => sameFolder(item, roots[index]));
+  const otherRoot = state.configured && !sameRoots;
 
   el.classList.toggle("ok", Boolean(state.configured) && !otherRoot);
   el.classList.toggle("warn", Boolean(otherRoot) || (!state.configured && state.desktopExists));
 
   if (otherRoot) {
-    text.textContent = `Connected, but to a different folder: ${state.configuredRoot}`;
+    text.textContent = `Connected, but to different folders: ${configured.join(", ")}`;
   } else if (state.configured) {
     text.textContent = "Connected to Claude Desktop";
   } else if (state.desktopExists) {
     text.textContent = "The server is not added to Claude Desktop yet";
   } else {
     text.textContent = "The Claude Desktop config does not exist yet";
+  }
+}
+
+function renderExtraRoots() {
+  const list = $("extraRoots");
+  list.textContent = "";
+
+  if (!extraRoots.length) {
+    const empty = document.createElement("p");
+    empty.className = "root-empty";
+    empty.textContent = "None yet — the working folder above is the only one.";
+    list.append(empty);
+    return;
+  }
+
+  for (const item of extraRoots) {
+    const row = document.createElement("div");
+    row.className = "root-item";
+
+    const code = document.createElement("code");
+    code.textContent = item;
+    code.title = item;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ghost";
+    btn.textContent = "Remove";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await setState({ removeRoot: item }, "Folder removed");
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    row.append(code, btn);
+    list.append(row);
+  }
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return "…";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let index = -1;
+  do {
+    value /= 1024;
+    index += 1;
+  } while (value >= 1024 && index < units.length - 1);
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatDate(value) {
+  if (!value) return "unknown time";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown time";
+  return date.toLocaleString();
+}
+
+function historyRow({ title, sub, tag, action }) {
+  const row = document.createElement("div");
+  row.className = "history-row";
+
+  const main = document.createElement("div");
+  main.className = "history-main";
+
+  const titleEl = document.createElement("div");
+  titleEl.className = "history-title";
+  titleEl.textContent = title;
+  if (tag) {
+    const tagEl = document.createElement("span");
+    tagEl.className = "history-tag";
+    tagEl.textContent = tag;
+    titleEl.append(tagEl);
+  }
+  main.append(titleEl);
+
+  if (sub) {
+    const subEl = document.createElement("div");
+    subEl.className = "history-sub";
+    subEl.textContent = sub;
+    main.append(subEl);
+  }
+
+  row.append(main);
+  if (action) row.append(action);
+  return row;
+}
+
+function makeRestoreButton(label, handler) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "ghost history-action";
+  btn.textContent = label;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await handler();
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+
+async function restoreTrashEntry(id) {
+  try {
+    await api("/api/trash/restore", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    });
+    toast("Restored from the trash");
+    await loadHistory();
+  } catch (e) {
+    if (/already exists/i.test(e.message) && confirm(`${e.message}\n\nReplace it?`)) {
+      try {
+        await api("/api/trash/restore", {
+          method: "POST",
+          body: JSON.stringify({ id, overwrite: true }),
+        });
+        toast("Restored and replaced the existing item");
+        await loadHistory();
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return;
+    }
+    toast(e.message, true);
+  }
+}
+
+async function restoreBackupEntry(name) {
+  try {
+    await api("/api/backup/restore", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    toast("Backup restored — the previous version was saved as a new backup");
+    await loadHistory();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+const HISTORY_EMPTY = {
+  trash: "The trash is empty.",
+  backups: "No backups yet. Backups appear when Claude edits or replaces files.",
+  commands: "No commands have been run by the server yet.",
+  activity: "No activity recorded yet.",
+};
+
+function renderHistory() {
+  const body = $("historyBody");
+  body.textContent = "";
+
+  if (!history) return;
+  const items = history[activeTab] || [];
+
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = HISTORY_EMPTY[activeTab] || "Nothing here yet.";
+    body.append(empty);
+    return;
+  }
+
+  for (const item of items) {
+    if (activeTab === "trash") {
+      body.append(
+        historyRow({
+          title: folderName(item.originalPath),
+          tag: item.type,
+          sub: `${formatDate(item.deletedAt)} · ${item.originalPath}`,
+          action: item.exists
+            ? makeRestoreButton("Restore", () => restoreTrashEntry(item.id))
+            : null,
+        }),
+      );
+    } else if (activeTab === "backups") {
+      body.append(
+        historyRow({
+          title: item.target ? folderName(item.target) : item.name,
+          sub:
+            `${item.target || "Target unknown — use undo_last_change in Claude"} · ` +
+            `${formatBytes(item.size)} · ${formatDate(item.modified)}`,
+          action: item.target
+            ? makeRestoreButton("Restore", () => restoreBackupEntry(item.name))
+            : null,
+        }),
+      );
+    } else if (activeTab === "commands") {
+      const isEvent = Boolean(item.event);
+      const title = isEvent
+        ? `${item.event}: ${item.command || item.id}`
+        : item.command || "(no command)";
+      const parts = [formatDate(item.at)];
+      if (item.cwd) parts.push(item.cwd);
+      if (item.exitCode !== undefined && item.exitCode !== null) {
+        parts.push(`exit ${item.exitCode}`);
+      }
+      if (item.timedOut) parts.push("timed out");
+      if (item.durationMs) parts.push(`${item.durationMs} ms`);
+      body.append(historyRow({ title, tag: isEvent ? item.event : null, sub: parts.join(" · ") }));
+    } else {
+      body.append(
+        historyRow({
+          title: item.description || item.kind,
+          tag: item.kind,
+          sub: formatDate(item.at),
+        }),
+      );
+    }
+  }
+}
+
+async function loadHistory() {
+  try {
+    history = await api("/api/history");
+    $("historyDataDir").textContent = "Data folder: " + history.dataDir;
+    $("countTrash").textContent = history.trash.length;
+    $("countBackups").textContent = history.backups.length;
+    $("countCommands").textContent = history.commands.length;
+    $("countActivity").textContent = history.activity.length;
+    renderHistory();
+  } catch (e) {
+    history = null;
+    $("historyBody").textContent = "";
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "Could not load the history: " + e.message;
+    $("historyBody").append(empty);
   }
 }
 
@@ -227,12 +477,14 @@ async function refreshStatus() {
   const state = await api("/api/state");
   savedRoot = state.root;
   recentList = state.recent || [];
+  extraRoots = state.extraRoots || [];
   $("currentRoot").textContent = state.root;
   $("allowOutside").checked = state.allowOutside;
   $("allowShell").checked = state.allowShell;
   $("serverPath").textContent = state.serverEntry;
   $("configPath").textContent =
     state.desktopConfig + (state.desktopExists ? "" : " (no file yet)");
+  renderExtraRoots();
   updateConnStatus(state);
   renderRecent(recentList, current?.path || state.root);
   return state;
@@ -256,12 +508,15 @@ async function setState(patch, okMessage) {
   });
   savedRoot = data.root;
   recentList = data.recent || [];
+  extraRoots = data.extraRoots || [];
   $("currentRoot").textContent = data.root;
   $("allowOutside").checked = data.allowOutside;
   $("allowShell").checked = data.allowShell;
+  renderExtraRoots();
   renderRecent(recentList, current?.path || data.root);
   await refreshPreview();
   updateConnStatus(await api("/api/state"));
+  await loadHistory();
   if (okMessage) toast(okMessage);
   return data;
 }
@@ -278,6 +533,7 @@ async function init() {
     const state = await refreshStatus();
     await refreshPreview();
     await navigate(state.root);
+    await loadHistory();
   } catch (e) {
     showLog("Could not load the settings", [{ text: e.message }], true);
     toast(e.message, true);
@@ -344,6 +600,69 @@ $("openFolder").addEventListener("click", async () => {
     });
   } catch (e) {
     toast(e.message, true);
+  }
+});
+
+async function addExtraRoot(value) {
+  if (!value || !value.trim()) {
+    toast("Enter a folder path first", true);
+    return;
+  }
+  await setState({ addRoot: value.trim() }, "Folder added");
+}
+
+$("addRoot").addEventListener("click", async () => {
+  const btn = $("addRoot");
+  btn.disabled = true;
+  try {
+    await addExtraRoot($("extraRootInput").value);
+    $("extraRootInput").value = "";
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("extraRootInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    $("addRoot").click();
+  }
+});
+
+$("addCurrentRoot").addEventListener("click", async () => {
+  if (!current) return;
+  const btn = $("addCurrentRoot");
+  btn.disabled = true;
+  try {
+    await addExtraRoot(current.path);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.addEventListener("click", () => {
+    activeTab = tab.dataset.tab || "trash";
+    for (const other of document.querySelectorAll(".tab")) {
+      other.classList.toggle("active", other === tab);
+    }
+    renderHistory();
+  });
+}
+
+$("refreshHistory").addEventListener("click", async () => {
+  const btn = $("refreshHistory");
+  btn.disabled = true;
+  btn.textContent = "Loading…";
+  try {
+    await loadHistory();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Refresh";
   }
 });
 
@@ -440,4 +759,87 @@ $("copyCode").addEventListener("click", async () => {
   }
 });
 
+/* ------------------------------------------------------------------ updates */
+
+const DISMISS_KEY = "cfm-update-dismissed";
+
+function updateSize(n) {
+  if (!n) return "";
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB";
+}
+
+function renderUpdate(info, manual) {
+  $("appVersion").textContent = info.current ? "v" + info.current : "";
+  const banner = $("updateBanner");
+
+  if (manual) {
+    if (!info.enabled) toast("Update check is turned off (UI_NO_UPDATE_CHECK=1).", true);
+    else if (info.error) toast(info.error, true);
+    else if (info.noReleases) toast("No releases have been published yet.");
+    else if (!info.hasUpdate) toast("You have the latest version" + (info.current ? " (v" + info.current + ")" : "") + ".");
+  }
+
+  if (!info.hasUpdate) {
+    banner.hidden = true;
+    return;
+  }
+
+  let dismissed = null;
+  try {
+    dismissed = localStorage.getItem(DISMISS_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+  if (!manual && dismissed === info.tag) return;
+
+  $("updateTitle").textContent = "Update available: v" + info.current + " → v" + info.latest;
+  const meta = [];
+  if (info.publishedAt) meta.push(new Date(info.publishedAt).toLocaleDateString());
+  $("updateMeta").textContent = meta.join(" · ");
+  $("updateLink").href = info.url;
+
+  const installer = (info.assets || []).find((a) => /\.(exe|msi)$/i.test(a.name)) || (info.assets || [])[0];
+  const download = $("updateDownload");
+  if (installer) {
+    download.href = installer.url;
+    download.textContent = "Download " + installer.name + (installer.size ? " (" + updateSize(installer.size) + ")" : "");
+    download.hidden = false;
+  } else {
+    download.hidden = true;
+  }
+
+  banner.dataset.tag = info.tag;
+  banner.hidden = false;
+}
+
+async function checkUpdate(manual = false) {
+  const btn = $("checkUpdate");
+  if (manual) {
+    btn.disabled = true;
+    btn.textContent = "Checking…";
+  }
+  try {
+    renderUpdate(await api("/api/update" + (manual ? "?force=1" : "")), manual);
+  } catch (e) {
+    if (manual) toast(e.message, true);
+  } finally {
+    if (manual) {
+      btn.disabled = false;
+      btn.textContent = "Check for updates";
+    }
+  }
+}
+
+$("checkUpdate").addEventListener("click", () => checkUpdate(true));
+$("updateDismiss").addEventListener("click", () => {
+  const banner = $("updateBanner");
+  try {
+    localStorage.setItem(DISMISS_KEY, banner.dataset.tag || "");
+  } catch {
+    /* storage unavailable */
+  }
+  banner.hidden = true;
+});
+
+checkUpdate(false);
 init();

@@ -3,19 +3,21 @@
  * MCP server for managing files and folders.
  *
  * Tools:
- *   list_directory, read_file, write_file, append_file, edit_file, multi_edit,
- *   create_directory, move_path, copy_path, delete_path, file_info,
+ *   list_directory, list_tree, list_roots, read_file, read_image, write_file,
+ *   append_file, edit_file, multi_edit, replace_in_files, create_directory,
+ *   move_path, copy_path, zip_path, unzip_path, delete_path, file_info,
  *   find_files, search_content, list_trash, restore_path, undo_last_change
- *   and optionally run_command (terminal, disabled by default).
+ *   and, when MCP_ALLOW_SHELL=1: run_command, start_process, read_output,
+ *   stop_process, list_processes.
  *
  * Safety:
- *   All operations are limited to MCP_FILE_ROOT (defaults to the current
- *   working directory). To allow arbitrary paths, set
- *   MCP_ALLOW_OUTSIDE_ROOT=1.
- *   The terminal tool is only registered when MCP_ALLOW_SHELL=1 is set.
+ *   All operations are limited to MCP_FILE_ROOTS (falls back to
+ *   MCP_FILE_ROOT, then the current working directory). To allow arbitrary
+ *   paths, set MCP_ALLOW_OUTSIDE_ROOT=1.
+ *   The terminal tools are only registered when MCP_ALLOW_SHELL=1 is set.
  *   Commands run with the rights of the current user and are not sandboxed.
  *
- * Trash and backups are stored in <root>/.mcp.
+ * Trash and backups are stored in <first root>/.mcp.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -25,18 +27,45 @@ import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
 
-const ROOT = path.resolve(process.env.MCP_FILE_ROOT || process.cwd());
+/**
+ * Allowed folders. MCP_FILE_ROOTS is a list separated by the platform path
+ * delimiter (";" on Windows, ":" elsewhere); relative paths resolve against
+ * the first one.
+ */
+const ROOTS = (() => {
+  const raw = (process.env.MCP_FILE_ROOTS || "").trim();
+  const items = raw
+    ? raw.split(path.delimiter).map((item) => item.trim()).filter(Boolean)
+    : [process.env.MCP_FILE_ROOT || process.cwd()];
+
+  const seen = new Set();
+  const roots = [];
+  for (const item of items) {
+    const abs = path.resolve(item);
+    const key = process.platform === "win32" ? abs.toLowerCase() : abs;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    roots.push(abs);
+  }
+  return roots.length ? roots : [process.cwd()];
+})();
+const ROOT = ROOTS[0];
 const ALLOW_OUTSIDE = /^(1|true|yes)$/i.test(
   process.env.MCP_ALLOW_OUTSIDE_ROOT || "",
 );
 const MAX_READ_CHARS = Number(process.env.MCP_MAX_READ_CHARS || 400_000);
 const MAX_LIST_ENTRIES = Number(process.env.MCP_MAX_LIST_ENTRIES || 5_000);
+const MAX_IMAGE_BYTES = Number(process.env.MCP_MAX_IMAGE_BYTES || 5_000_000);
 const ALLOW_SHELL = /^(1|true|yes)$/i.test(process.env.MCP_ALLOW_SHELL || "");
 const MAX_OUTPUT_CHARS = Number(process.env.MCP_MAX_OUTPUT_CHARS || 200_000);
 const SHELL_TIMEOUT_DEFAULT = 30_000;
 const SHELL_TIMEOUT_MAX = 300_000;
+const MAX_BG_PROCESSES = Number(process.env.MCP_MAX_PROCESSES || 8);
+const MAX_PROCESS_BUFFER = Number(process.env.MCP_MAX_PROCESS_BUFFER || 100_000);
+const MAX_ARCHIVE_BYTES = Number(process.env.MCP_MAX_ARCHIVE_BYTES || 500_000_000);
 
 const DATA_DIR = process.env.MCP_DATA_DIR
   ? path.resolve(process.env.MCP_DATA_DIR)
@@ -47,12 +76,31 @@ const TRASH_INDEX = path.join(DATA_DIR, "trash.json");
 const ACTIVITY_FILE = path.join(DATA_DIR, "activity.json");
 const SHELL_LOG = path.join(DATA_DIR, "commands.log");
 
+/** Every folder that belongs to the server, plus the shared data folder. */
+const PROTECTED_DIRS = [...new Set([DATA_DIR, ...ROOTS.map((root) => path.join(root, ".mcp"))])];
+
 const DEFAULT_IGNORES = ["node_modules", ".git", ".mcp", ".svn", ".hg"];
 const MAX_ACTIVITY = 100;
 
 /* -------------------------------------------------------------------------- */
 /*                                   Utilities                                */
 /* -------------------------------------------------------------------------- */
+
+function rootOf(abs) {
+  for (const root of ROOTS) {
+    const rel = path.relative(root, abs);
+    if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) return root;
+  }
+  return null;
+}
+
+function insideRoots(abs) {
+  return rootOf(abs) !== null;
+}
+
+function formatRootList() {
+  return ROOTS.map((root) => `  • ${root}`).join("\n");
+}
 
 function resolvePath(input, { allowRoot = true } = {}) {
   if (typeof input !== "string" || input.trim() === "") {
@@ -64,34 +112,30 @@ function resolvePath(input, { allowRoot = true } = {}) {
     ? path.resolve(target)
     : path.resolve(ROOT, target);
 
-  if (!allowRoot && abs === ROOT) {
-    throw new Error("The root folder cannot be modified.");
+  if (!allowRoot && ROOTS.includes(abs)) {
+    throw new Error(`A root folder cannot be modified: ${abs}`);
   }
 
-  if (!ALLOW_OUTSIDE) {
-    const rel = path.relative(ROOT, abs);
-    const outside =
-      rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel);
-    if (outside) {
-      throw new Error(
-        `Path is outside the allowed folder: ${abs}\nAllowed folder: ${ROOT}\n` +
-          `To allow other paths, set MCP_ALLOW_OUTSIDE_ROOT=1.`,
-      );
-    }
+  if (!ALLOW_OUTSIDE && !insideRoots(abs)) {
+    throw new Error(
+      `Path is outside the allowed folders: ${abs}\nAllowed folders:\n${formatRootList()}\n` +
+        `To allow other paths, set MCP_ALLOW_OUTSIDE_ROOT=1.`,
+    );
   }
 
   return abs;
 }
 
 function assertNotData(abs) {
-  const rel = path.relative(DATA_DIR, abs);
-  const inside =
-    abs === DATA_DIR ||
-    (!rel.startsWith("..") && !path.isAbsolute(rel) && rel !== "");
-  if (inside) {
-    throw new Error(
-      `Service folder ${DATA_DIR} is protected: it contains the trash and backups.`,
-    );
+  for (const dir of PROTECTED_DIRS) {
+    const rel = path.relative(dir, abs);
+    const inside =
+      abs === dir || (!rel.startsWith("..") && !path.isAbsolute(rel) && rel !== "");
+    if (inside) {
+      throw new Error(
+        `Service folder ${dir} is protected: it contains the trash and backups.`,
+      );
+    }
   }
 }
 
@@ -120,6 +164,14 @@ function text(value) {
   return { content: [{ type: "text", text: value }] };
 }
 
+const IMAGE_MIME = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+};
+
 function fail(error) {
   const message = error instanceof Error ? error.message : String(error);
   return { isError: true, content: [{ type: "text", text: `Error: ${message}` }] };
@@ -138,10 +190,10 @@ function newId() {
 }
 
 function shortName(abs) {
-  const rel = path.relative(ROOT, abs);
-  if (rel === "") return ".";
-  if (rel === ".." || rel.startsWith(".." + path.sep)) return abs;
-  return rel;
+  const root = rootOf(abs);
+  if (!root) return abs;
+  const rel = path.relative(root, abs);
+  return rel === "" ? "." : rel;
 }
 
 async function readJson(file, fallback) {
@@ -404,6 +456,356 @@ function countOccurrences(haystack, needle) {
 
 /* ---------------------------------- shell --------------------------------- */
 
+/* ----------------------------------- zip ---------------------------------- */
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) {
+    crc = CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date) {
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time:
+      (date.getHours() << 11) |
+      (date.getMinutes() << 5) |
+      Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
+}
+
+async function collectZipEntries(sources) {
+  const entries = [];
+  const names = new Set();
+  let totalBytes = 0;
+  let skippedLinks = 0;
+
+  function push(entry) {
+    if (names.has(entry.name)) {
+      throw new Error(
+        `Duplicate archive entry "${entry.name}". Two sources have the same name — rename one of them.`,
+      );
+    }
+    names.add(entry.name);
+    entries.push(entry);
+  }
+
+  async function add(abs, name) {
+    const stat = await statOrNull(abs);
+    if (!stat) throw new Error(`Source not found: ${abs}`);
+    if (stat.isSymbolicLink()) {
+      skippedLinks += 1;
+      return;
+    }
+
+    if (stat.isDirectory()) {
+      let children = [];
+      try {
+        children = await fs.readdir(abs);
+      } catch {
+        /* unreadable folder: keep going */
+      }
+      if (!children.length) push({ abs, name: `${name}/`, dir: true, stat });
+      for (const child of children) {
+        await add(path.join(abs, child), `${name}/${child}`);
+      }
+      return;
+    }
+
+    totalBytes += stat.size;
+    if (totalBytes > MAX_ARCHIVE_BYTES) {
+      throw new Error(
+        `The sources are larger than ${formatBytes(MAX_ARCHIVE_BYTES)}; ` +
+          `increase MCP_MAX_ARCHIVE_BYTES to zip them.`,
+      );
+    }
+    push({ abs, name, dir: false, stat, size: stat.size });
+  }
+
+  for (const source of sources) {
+    const abs = resolvePath(source);
+    if (ROOTS.includes(abs)) {
+      throw new Error(
+        `Refusing to zip a whole root folder (${abs}). Zip its subfolders instead.`,
+      );
+    }
+    assertNotData(abs);
+    const base = path.basename(abs);
+    if (!base) throw new Error(`Cannot zip ${abs}: empty folder name.`);
+    await add(abs, base);
+  }
+
+  return { entries, totalBytes, skippedLinks };
+}
+
+async function writeZip(entries, destination) {
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    let raw = Buffer.alloc(0);
+    let compressed = raw;
+    let method = 0;
+    let crc = 0;
+
+    if (!entry.dir) {
+      raw = await fs.readFile(entry.abs);
+      crc = crc32(raw);
+      compressed = raw;
+      const deflated = zlib.deflateRawSync(raw, { level: 6 });
+      if (deflated.length < raw.length) {
+        compressed = deflated;
+        method = 8;
+      }
+    }
+
+    const nameBuf = Buffer.from(entry.name, "utf8");
+    const flags = /[^\x00-\x7f]/.test(entry.name) ? 0x0800 : 0;
+    const { time, date } = dosDateTime(entry.stat.mtime);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(time, 10);
+    local.writeUInt16LE(date, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(compressed.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+
+    chunks.push(local, nameBuf, compressed);
+    central.push({
+      nameBuf,
+      flags,
+      method,
+      time,
+      date,
+      crc,
+      compressedSize: compressed.length,
+      size: raw.length,
+      offset,
+      dir: entry.dir,
+    });
+    offset += local.length + nameBuf.length + compressed.length;
+  }
+
+  const centralStart = offset;
+  for (const item of central) {
+    const header = Buffer.alloc(46);
+    header.writeUInt32LE(0x02014b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(20, 6);
+    header.writeUInt16LE(item.flags, 8);
+    header.writeUInt16LE(item.method, 10);
+    header.writeUInt16LE(item.time, 12);
+    header.writeUInt16LE(item.date, 14);
+    header.writeUInt32LE(item.crc, 16);
+    header.writeUInt32LE(item.compressedSize, 20);
+    header.writeUInt32LE(item.size, 24);
+    header.writeUInt16LE(item.nameBuf.length, 28);
+    header.writeUInt16LE(0, 30);
+    header.writeUInt16LE(0, 32);
+    header.writeUInt16LE(0, 34);
+    header.writeUInt16LE(0, 36);
+    header.writeUInt32LE(item.dir ? 0x10 : 0, 38);
+    header.writeUInt32LE(item.offset, 42);
+    chunks.push(header, item.nameBuf);
+    offset += header.length + item.nameBuf.length;
+  }
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(central.length, 8);
+  eocd.writeUInt16LE(central.length, 10);
+  eocd.writeUInt32LE(offset - centralStart, 12);
+  eocd.writeUInt32LE(centralStart, 16);
+
+  await fs.writeFile(destination, Buffer.concat([...chunks, eocd]));
+  return { size: offset + eocd.length };
+}
+
+async function readZip(source) {
+  const buf = await fs.readFile(source);
+  if (buf.length > MAX_ARCHIVE_BYTES) {
+    throw new Error(`Archive is larger than ${formatBytes(MAX_ARCHIVE_BYTES)}.`);
+  }
+
+  const min = Math.max(0, buf.length - 66_000);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= min; i -= 1) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd === -1) {
+    throw new Error("Not a ZIP archive: the end of the central directory was not found.");
+  }
+
+  const count = buf.readUInt16LE(eocd + 10);
+  const centralOffset = buf.readUInt32LE(eocd + 16);
+  if (count === 0xffff || centralOffset === 0xffffffff) {
+    throw new Error("ZIP64 archives are not supported.");
+  }
+
+  const entries = [];
+  let pointer = centralOffset;
+  for (let i = 0; i < count; i += 1) {
+    if (
+      pointer + 46 > buf.length ||
+      buf.readUInt32LE(pointer) !== 0x02014b50
+    ) {
+      throw new Error("The ZIP central directory is damaged.");
+    }
+
+    const flags = buf.readUInt16LE(pointer + 8);
+    const method = buf.readUInt16LE(pointer + 10);
+    const crc = buf.readUInt32LE(pointer + 16);
+    const compressedSize = buf.readUInt32LE(pointer + 20);
+    const size = buf.readUInt32LE(pointer + 24);
+    const nameLength = buf.readUInt16LE(pointer + 28);
+    const extraLength = buf.readUInt16LE(pointer + 30);
+    const commentLength = buf.readUInt16LE(pointer + 32);
+    const localOffset = buf.readUInt32LE(pointer + 42);
+    const name = buf
+      .subarray(pointer + 46, pointer + 46 + nameLength)
+      .toString("utf8");
+
+    if (flags & 0x1) throw new Error(`Encrypted entries are not supported: ${name}`);
+    if (method !== 0 && method !== 8) {
+      throw new Error(`Unsupported compression method ${method} for ${name}.`);
+    }
+    if (
+      compressedSize === 0xffffffff ||
+      size === 0xffffffff ||
+      localOffset === 0xffffffff
+    ) {
+      throw new Error("ZIP64 archives are not supported.");
+    }
+
+    entries.push({
+      name,
+      method,
+      crc,
+      compressedSize,
+      size,
+      localOffset,
+      dir: name.endsWith("/") || name.endsWith("\\"),
+    });
+    pointer += 46 + nameLength + extraLength + commentLength;
+  }
+
+  return { buf, entries };
+}
+
+function safeZipTarget(destination, name) {
+  const clean = name.replace(/\\/g, "/");
+  if (clean.startsWith("/") || /^[A-Za-z]:/.test(clean)) {
+    throw new Error(`Unsafe archive path: ${name}`);
+  }
+  const target = path.resolve(destination, clean);
+  const rel = path.relative(destination, target);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`Unsafe archive path: ${name}`);
+  }
+  return target;
+}
+
+async function extractZip(archive, destination, overwrite) {
+  const { buf, entries } = await readZip(archive);
+  if (entries.length > 20_000) throw new Error("Archive has too many entries (max 20000).");
+
+  let totalSize = 0;
+  const planned = entries.map((entry) => {
+    totalSize += entry.size;
+    if (totalSize > MAX_ARCHIVE_BYTES) {
+      throw new Error(
+        `Archive expands to more than ${formatBytes(MAX_ARCHIVE_BYTES)}.`,
+      );
+    }
+    return { ...entry, target: safeZipTarget(destination, entry.name) };
+  });
+
+  if (!overwrite) {
+    const clashes = [];
+    for (const item of planned) {
+      if (await statOrNull(item.target)) clashes.push(item.name);
+      if (clashes.length >= 5) break;
+    }
+    if (clashes.length) {
+      throw new Error(
+        `These paths already exist: ${clashes.join(", ")}. ` +
+          `Set overwrite=true to replace them.`,
+      );
+    }
+  }
+
+  let files = 0;
+  let folders = 0;
+  let bytes = 0;
+
+  for (const item of planned) {
+    if (item.dir) {
+      await fs.mkdir(item.target, { recursive: true });
+      folders += 1;
+      continue;
+    }
+
+    const pointer = item.localOffset;
+    if (pointer + 30 > buf.length || buf.readUInt32LE(pointer) !== 0x04034b50) {
+      throw new Error(`Damaged entry in the archive: ${item.name}`);
+    }
+    const nameLength = buf.readUInt16LE(pointer + 26);
+    const extraLength = buf.readUInt16LE(pointer + 28);
+    const start = pointer + 30 + nameLength + extraLength;
+    const data = buf.subarray(start, start + item.compressedSize);
+
+    let content;
+    if (item.method === 8) {
+      try {
+        content = zlib.inflateRawSync(data);
+      } catch {
+        throw new Error(`Could not decompress ${item.name}: the archive is damaged.`);
+      }
+    } else {
+      content = data;
+    }
+
+    if (content.length !== item.size) {
+      throw new Error(`Size mismatch for ${item.name}: the archive is damaged.`);
+    }
+    if (!item.dir && crc32(content) !== item.crc) {
+      throw new Error(`CRC mismatch for ${item.name}: the archive is damaged.`);
+    }
+
+    await fs.mkdir(path.dirname(item.target), { recursive: true });
+    await fs.writeFile(item.target, content);
+    files += 1;
+    bytes += content.length;
+  }
+
+  return { files, folders, bytes, entries: planned.length };
+}
+
 const SHELL_MODE = (
   process.env.MCP_SHELL || (process.platform === "win32" ? "powershell" : "sh")
 ).toLowerCase();
@@ -576,22 +978,25 @@ function runCommand(command, cwd, timeoutMs) {
   });
 }
 
-async function logCommand(result) {
+async function logEvent(record) {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
     const line =
-      JSON.stringify({
-        at: new Date().toISOString(),
-        cwd: result.cwd,
-        command: result.command,
-        exitCode: result.code,
-        timedOut: result.timedOut,
-        durationMs: result.durationMs,
-      }) + "\n";
+      JSON.stringify({ at: new Date().toISOString(), ...record }) + "\n";
     await fs.appendFile(SHELL_LOG, line, "utf8");
   } catch {
     /* logging must never break a command */
   }
+}
+
+async function logCommand(result) {
+  await logEvent({
+    cwd: result.cwd,
+    command: result.command,
+    exitCode: result.code,
+    timedOut: result.timedOut,
+    durationMs: result.durationMs,
+  });
 }
 
 function formatCommandResult(result) {
@@ -628,10 +1033,198 @@ function formatCommandResult(result) {
 /*                                   Server                                  */
 /* -------------------------------------------------------------------------- */
 
+/* --------------------------- background processes ------------------------- */
+
+const BACKGROUND = new Map();
+
+function appendProcessOutput(record, key, chunk) {
+  const truncatedKey = `${key}Truncated`;
+  if (record[truncatedKey]) return;
+  const next = record[key] + chunk;
+  if (next.length > MAX_PROCESS_BUFFER) {
+    record[key] = next.slice(0, MAX_PROCESS_BUFFER);
+    record[truncatedKey] = true;
+    return;
+  }
+  record[key] = next;
+}
+
+function waitForExit(record, ms) {
+  if (record.finished) return Promise.resolve(true);
+  if (!ms) return Promise.resolve(false);
+  return Promise.race([
+    record.exitPromise.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), ms)),
+  ]);
+}
+
+function describeProcess(record) {
+  const endedAt = record.finished ? record.endedAt : Date.now();
+  const elapsed = (endedAt - record.startedAt) / 1000;
+  const state = record.finished
+    ? `finished, exit code ${record.exitCode ?? "unknown"}${
+        record.signal ? ` (signal ${record.signal})` : ""
+      }`
+    : `running, pid ${record.pid}`;
+  return [
+    `Process ${record.id}: ${state} (${elapsed.toFixed(2)} s)`,
+    `$ ${record.command}`,
+    `shell: ${record.shell} · folder: ${record.cwd}`,
+  ];
+}
+
+function formatProcessOutput(record) {
+  const parts = describeProcess(record);
+  parts.push("", "--- stdout ---", record.stdout.trimEnd() || "(empty)");
+  if (record.stdoutTruncated) {
+    parts.push(`… stdout truncated to ${MAX_PROCESS_BUFFER} characters.`);
+  }
+  if (record.stderr.trim()) {
+    parts.push("", "--- stderr ---", record.stderr.trimEnd());
+    if (record.stderrTruncated) {
+      parts.push(`… stderr truncated to ${MAX_PROCESS_BUFFER} characters.`);
+    }
+  }
+  if (record.spawnError) parts.push("", `Failed to start: ${record.spawnError}`);
+  if (!record.finished) {
+    parts.push(
+      "",
+      `Read more: read_output({ id: "${record.id}" }). Stop: stop_process({ id: "${record.id}" }).`,
+    );
+  }
+  return parts.join("\n");
+}
+
+function startBackgroundProcess(command, cwd) {
+  const finished = [...BACKGROUND.values()].filter((record) => record.finished);
+  while (BACKGROUND.size >= MAX_BG_PROCESSES && finished.length) {
+    BACKGROUND.delete(finished.shift().id);
+  }
+  if (BACKGROUND.size >= MAX_BG_PROCESSES) {
+    throw new Error(
+      `Too many background processes (max ${MAX_BG_PROCESSES}). Stop one with stop_process first.`,
+    );
+  }
+
+  const { file, args, shellName } = shellInvocation(command);
+  const child = spawn(file, args, {
+    cwd,
+    windowsHide: true,
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      GIT_PAGER: "cat",
+      PAGER: "cat",
+      NO_COLOR: "1",
+      TERM: "dumb",
+    },
+  });
+
+  const record = {
+    id: newId(),
+    command,
+    cwd,
+    shell: shellName,
+    child,
+    pid: child.pid,
+    startedAt: Date.now(),
+    endedAt: null,
+    stdout: "",
+    stderr: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    exitCode: null,
+    signal: null,
+    finished: false,
+    spawnError: null,
+  };
+  record.exitPromise = new Promise((resolve) => {
+    record.resolveExit = resolve;
+  });
+
+  child.on("error", (error) => {
+    record.spawnError = error.message;
+    record.finished = true;
+    record.endedAt = Date.now();
+    record.resolveExit();
+  });
+  child.on("close", (code, signal) => {
+    record.exitCode = typeof code === "number" ? code : null;
+    record.signal = signal || null;
+    record.finished = true;
+    record.endedAt = Date.now();
+    if (shellName.startsWith("powershell") || shellName === "pwsh") {
+      record.stderr = decodePowerShellStderr(record.stderr);
+    }
+    logEvent({
+      event: "exit",
+      id: record.id,
+      exitCode: record.exitCode,
+      durationMs: record.endedAt - record.startedAt,
+    });
+    record.resolveExit();
+  });
+  child.stdout?.on("data", (chunk) =>
+    appendProcessOutput(record, "stdout", chunk.toString("utf8")),
+  );
+  child.stderr?.on("data", (chunk) =>
+    appendProcessOutput(record, "stderr", chunk.toString("utf8")),
+  );
+
+  BACKGROUND.set(record.id, record);
+  logEvent({ event: "start", id: record.id, cwd, command, pid: record.pid });
+  return record;
+}
+
+function stopAllProcesses() {
+  for (const record of BACKGROUND.values()) {
+    if (!record.finished) killProcessTree(record.pid);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Server                                  */
+/* -------------------------------------------------------------------------- */
+
 const server = new McpServer({
   name: "claude-file-manager",
-  version: "1.2.0",
+  version: "1.3.0",
 });
+
+server.registerTool(
+  "list_roots",
+  {
+    title: "Show the allowed folders",
+    description:
+      "Lists the folders this server may work in. Relative paths in other " +
+      "tools resolve against the first root; absolute paths are accepted " +
+      "inside any listed root.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const lines = [];
+      for (let i = 0; i < ROOTS.length; i += 1) {
+        const root = ROOTS[i];
+        const stat = await statOrNull(root);
+        const state = !stat ? "missing" : stat.isDirectory() ? "folder" : "not a folder";
+        lines.push(
+          `${i === 0 ? "*" : " "} ${i + 1}. ${root} (${state})` +
+            (i === 0 ? "  ← default for relative paths" : ""),
+        );
+      }
+      return text(
+        `Allowed folders (${ROOTS.length}):\n\n${lines.join("\n")}\n\n` +
+          (ALLOW_OUTSIDE
+            ? "MCP_ALLOW_OUTSIDE_ROOT=1: any path is also allowed."
+            : "Paths outside these folders are rejected."),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
 
 server.registerTool(
   "list_directory",
@@ -739,6 +1332,133 @@ server.registerTool(
 );
 
 server.registerTool(
+  "list_tree",
+  {
+    title: "Show a compact project tree",
+    description:
+      "Renders a compact tree of folders and files with box-drawing characters. " +
+      "Much less noisy than a recursive list_directory. Skips node_modules, " +
+      ".git, .mcp and other service folders by default; limits depth and total " +
+      "entries.",
+    inputSchema: {
+      path: z.string().default(".").describe("Folder to render (defaults to root)"),
+      depth: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .default(3)
+        .describe("How many levels to show"),
+      show_files: z.boolean().default(true).describe("Show files (false = folders only)"),
+      include_sizes: z.boolean().default(false).describe("Show file sizes"),
+      show_hidden: z.boolean().default(true).describe("Show names starting with a dot"),
+      ignore: z
+        .array(z.string())
+        .default([])
+        .describe("Additional names/globs to skip"),
+      max_entries: z
+        .number()
+        .int()
+        .min(1)
+        .max(5000)
+        .default(800)
+        .describe("Maximum number of entries to print"),
+    },
+  },
+  async ({
+    path: inputPath,
+    depth,
+    show_files,
+    include_sizes,
+    show_hidden,
+    ignore,
+    max_entries,
+  }) => {
+    try {
+      const abs = resolvePath(inputPath);
+      const stat = await statOrNull(abs);
+      if (!stat) throw new Error(`Folder not found: ${abs}`);
+      if (!stat.isDirectory()) throw new Error(`Not a folder: ${abs}`);
+
+      const ignoreSet = new Set([...DEFAULT_IGNORES, ...ignore.filter((p) => !hasWildcard(p))]);
+      const ignoreGlobs = ignore.filter((p) => hasWildcard(p)).map((p) => globToRegExp(p));
+      const lines = [];
+      let shown = 0;
+      let dirs = 0;
+      let files = 0;
+      let truncated = false;
+
+      async function walk(dir, prefix, level) {
+        let entries;
+        try {
+          entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+          lines.push(`${prefix}└─ [access denied]`);
+          return;
+        }
+
+        const visible = entries
+          .filter((entry) => {
+            if (!show_hidden && entry.name.startsWith(".")) return false;
+            if (ignoreSet.has(entry.name)) return false;
+            return !ignoreGlobs.some((re) => re.test(entry.name));
+          })
+          .sort((a, b) => {
+            const aDir = a.isDirectory() && !a.isSymbolicLink();
+            const bDir = b.isDirectory() && !b.isSymbolicLink();
+            if (aDir !== bDir) return aDir ? -1 : 1;
+            return a.name.localeCompare(b.name, "en");
+          });
+
+        for (let i = 0; i < visible.length; i += 1) {
+          if (shown >= max_entries) {
+            truncated = true;
+            return;
+          }
+
+          const entry = visible[i];
+          const full = path.join(dir, entry.name);
+          const info = await statOrNull(full);
+          if (!info) continue;
+
+          const isDir = entry.isDirectory() && !entry.isSymbolicLink();
+          if (!isDir && !show_files) continue;
+
+          shown += 1;
+          if (isDir) dirs += 1;
+          else files += 1;
+
+          const last = i === visible.length - 1;
+          const linkMark = entry.isSymbolicLink() ? "@" : "";
+          const size =
+            include_sizes && !isDir && info.isFile() ? `  ${formatBytes(info.size)}` : "";
+          lines.push(
+            `${prefix}${last ? "└─ " : "├─ "}${entry.name}${isDir ? "/" : ""}${linkMark}${size}`,
+          );
+
+          if (isDir && level + 1 < depth) {
+            await walk(full, prefix + (last ? "   " : "│  "), level + 1);
+          }
+        }
+      }
+
+      await walk(abs, "", 0);
+
+      const header = `Tree: ${abs} (depth ${depth})`;
+      if (!shown) return text(`${header}\n\n(folder is empty)`);
+
+      const footer =
+        `\n\n${dirs} folder(s), ${files} file(s)` +
+        (truncated ? ` — stopped at ${max_entries} entries.` : "");
+
+      return text(`${header}\n\n${lines.join("\n")}${footer}`);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
   "read_file",
   {
     title: "Read a file",
@@ -800,6 +1520,63 @@ server.registerTool(
         : "";
 
       return text(`${header}\n---\n${content}${footer}`);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "read_image",
+  {
+    title: "View an image",
+    description:
+      "Returns an image file so you can actually see it (screenshots, design " +
+      "mockups, diagrams). Supports PNG, JPEG, GIF and WebP. The file must be " +
+      `at most ${formatBytes(MAX_IMAGE_BYTES)}. For text files use read_file.`,
+    inputSchema: {
+      path: z.string().describe("Image file path"),
+    },
+  },
+  async ({ path: inputPath }) => {
+    try {
+      const abs = resolvePath(inputPath);
+      let stat;
+      try {
+        stat = await fs.stat(abs);
+      } catch {
+        throw new Error(`File not found: ${abs}`);
+      }
+      if (stat.isDirectory()) throw new Error(`This is a folder, not a file: ${abs}`);
+
+      const mime = IMAGE_MIME[path.extname(abs).toLowerCase()];
+      if (!mime) {
+        throw new Error(
+          `Unsupported image format: ${path.extname(abs) || "(no extension)"}. ` +
+            `Supported: PNG, JPEG, GIF, WebP.`,
+        );
+      }
+      if (stat.size > MAX_IMAGE_BYTES) {
+        throw new Error(
+          `Image is ${formatBytes(stat.size)}, the limit is ${formatBytes(MAX_IMAGE_BYTES)}. ` +
+            `Resize it or raise MCP_MAX_IMAGE_BYTES.`,
+        );
+      }
+
+      const buf = await fs.readFile(abs);
+      return {
+        content: [
+          {
+            type: "image",
+            data: buf.toString("base64"),
+            mimeType: mime,
+          },
+          {
+            type: "text",
+            text: `Image: ${abs} (${formatBytes(stat.size)}, ${mime})`,
+          },
+        ],
+      };
     } catch (e) {
       return fail(e);
     }
@@ -958,9 +1735,12 @@ server.registerTool(
         );
       }
 
+      // A callback makes the replacement literal: "$&" and friends in
+      // new_string are no longer interpreted as replace patterns, matching
+      // the split/join behavior of the replace_all branch.
       const updated = replace_all
         ? content.split(old_string).join(new_string)
-        : content.replace(old_string, new_string);
+        : content.replace(old_string, () => new_string);
 
       const backup = await backupFile(abs);
       await fs.writeFile(abs, updated, "utf8");
@@ -1036,7 +1816,7 @@ server.registerTool(
         }
         current = edit.replace_all
           ? current.split(edit.old_string).join(edit.new_string)
-          : current.replace(edit.old_string, edit.new_string);
+          : current.replace(edit.old_string, () => edit.new_string);
       });
 
       const backup = await backupFile(abs);
@@ -1197,6 +1977,120 @@ server.registerTool(
       );
 
       return text(`Copied:\n  from: ${from}\n  to:   ${to}`);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "zip_path",
+  {
+    title: "Create a ZIP archive",
+    description:
+      "Packs files and folders into a ZIP archive. Each source keeps its own " +
+      "name at the top level of the archive; subfolders are included " +
+      "recursively. Symbolic links are skipped. UTF-8 file names are stored " +
+      "correctly. Set overwrite=true to replace an existing archive.",
+    inputSchema: {
+      sources: z
+        .array(z.string())
+        .min(1)
+        .describe("Files and folders to include, e.g. [\"src\", \"README.md\"]"),
+      destination: z.string().describe("Archive path, e.g. `backup.zip`"),
+      overwrite: z
+        .boolean()
+        .default(false)
+        .describe("Replace the archive if it already exists"),
+    },
+  },
+  async ({ sources, destination, overwrite }) => {
+    try {
+      const dest = resolvePath(destination, { allowRoot: false });
+      assertNotData(dest);
+
+      const existing = await statOrNull(dest);
+      if (existing?.isDirectory()) throw new Error(`Destination is a folder: ${dest}`);
+      if (existing && !overwrite) {
+        throw new Error(
+          `Archive already exists: ${dest}. Set overwrite=true to replace it.`,
+        );
+      }
+
+      const { entries, totalBytes, skippedLinks } = await collectZipEntries(sources);
+      if (!entries.length) {
+        throw new Error("Nothing to zip: all sources are empty or symlinks.");
+      }
+
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      const { size } = await writeZip(entries, dest);
+
+      await recordActivity(
+        "zip",
+        `Create ${shortName(dest)} (${entries.length} entries)`,
+        existing ? null : { kind: "remove", target: dest },
+      );
+
+      return text(
+        `Archive created: ${dest}\n` +
+          `Entries: ${entries.length} (${formatBytes(totalBytes)} of files)\n` +
+          `Archive size: ${formatBytes(size)}` +
+          (skippedLinks ? `\nSkipped symlinks: ${skippedLinks}` : ""),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "unzip_path",
+  {
+    title: "Extract a ZIP archive",
+    description:
+      "Extracts a ZIP archive into a folder, creating missing parent folders. " +
+      "Stored and deflated entries with UTF-8 names are supported (ZIP64 and " +
+      "encrypted archives are not). Paths that would escape the destination " +
+      "are rejected. By default nothing is overwritten.",
+    inputSchema: {
+      source: z.string().describe("Archive path"),
+      destination: z.string().describe("Folder to extract into"),
+      overwrite: z
+        .boolean()
+        .default(false)
+        .describe("Replace files that already exist (no backup is made)"),
+    },
+  },
+  async ({ source, destination, overwrite }) => {
+    try {
+      const archive = resolvePath(source);
+      const dest = resolvePath(destination, { allowRoot: false });
+      assertNotData(dest);
+
+      const archiveStat = await statOrNull(archive);
+      if (!archiveStat) throw new Error(`Archive not found: ${archive}`);
+      if (!archiveStat.isFile()) throw new Error(`Not a file: ${archive}`);
+
+      const existing = await statOrNull(dest);
+      if (existing && !existing.isDirectory()) {
+        throw new Error(`Destination is not a folder: ${dest}`);
+      }
+
+      await fs.mkdir(dest, { recursive: true });
+      const result = await extractZip(archive, dest, overwrite);
+
+      await recordActivity(
+        "unzip",
+        `Extract ${shortName(archive)} → ${shortName(dest)} (${result.files} files)`,
+        existing ? null : { kind: "remove", target: dest },
+      );
+
+      return text(
+        `Extracted: ${shortName(archive)} → ${dest}\n` +
+          `Files: ${result.files}, folders: ${result.folders}, ` +
+          `uncompressed: ${formatBytes(result.bytes)}` +
+          (existing ? "\nThe destination already existed, so this step cannot be undone." : ""),
+      );
     } catch (e) {
       return fail(e);
     }
@@ -1445,6 +2339,17 @@ server.registerTool(
         .min(1)
         .default(1_000_000)
         .describe("Skip files larger than this size (bytes)"),
+      context_lines: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .default(0)
+        .describe("Show this many lines before and after each match"),
+      files_only: z
+        .boolean()
+        .default(false)
+        .describe("Only list matching files with their match counts"),
       ignore: z
         .array(z.string())
         .default([])
@@ -1459,6 +2364,8 @@ server.registerTool(
     include,
     max_results,
     max_file_size,
+    context_lines,
+    files_only,
     ignore,
   }) => {
     try {
@@ -1481,7 +2388,8 @@ server.registerTool(
 
       const includeRegex = include ? globToRegExp(include) : null;
 
-      const hits = [];
+      const files = new Map();
+      let matchCount = 0;
       let filesScanned = 0;
       let filesSkipped = 0;
 
@@ -1489,7 +2397,7 @@ server.registerTool(
         maxDepth: 30,
         extraIgnore: ignore,
         onFile: async (full, entry) => {
-          if (hits.length >= max_results) return;
+          if (matchCount >= max_results) return;
           const rel = normalizeRel(path.relative(start, full));
 
           if (includeRegex && !includeRegex.test(rel) && !includeRegex.test(entry.name)) {
@@ -1521,38 +2429,260 @@ server.registerTool(
 
           filesScanned += 1;
           const lines = buf.toString("utf8").split(/\r\n|\n|\r/);
+          const matches = [];
 
           for (let i = 0; i < lines.length; i += 1) {
-            if (hits.length >= max_results) break;
-            const line = lines[i];
+            if (matchCount >= max_results) break;
             matcher.lastIndex = 0;
-            // Reset global regex state between lines.
-            if (matcher.test(line)) {
-              const shown =
-                line.length > 300 ? line.slice(0, 300) + "…" : line;
-              hits.push(`${rel}:${i + 1}: ${shown.trim()}`);
+            if (matcher.test(lines[i])) {
+              matches.push(i);
+              matchCount += 1;
             }
           }
+
+          if (matches.length) files.set(rel, { rel, lines, matches });
         },
       });
 
-      if (!hits.length) {
+      if (!matchCount) {
         return text(
           `No matches for (${query}) in ${start}. ` +
             `Files scanned: ${filesScanned}.`,
         );
       }
 
+      const blocks = [];
+      for (const file of files.values()) {
+        if (files_only) {
+          blocks.push(`${file.rel} (${file.matches.length})`);
+          continue;
+        }
+
+        const matchSet = new Set(file.matches);
+        const ranges = [];
+        for (const index of file.matches) {
+          const from = Math.max(0, index - context_lines);
+          const to = Math.min(file.lines.length - 1, index + context_lines);
+          const last = ranges[ranges.length - 1];
+          if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
+          else ranges.push({ from, to });
+        }
+
+        const out = [`${file.rel}:`];
+        ranges.forEach((range, rangeIndex) => {
+          if (rangeIndex > 0) out.push("  --");
+          for (let i = range.from; i <= range.to; i += 1) {
+            const mark = matchSet.has(i) ? ":" : "-";
+            const line = file.lines[i];
+            const shown = line.length > 300 ? line.slice(0, 300) + "…" : line;
+            out.push(`  ${String(i + 1).padStart(4, " ")}${mark} ${shown.trim()}`);
+          }
+        });
+        blocks.push(out.join("\n"));
+      }
+
       const suffix =
-        hits.length >= max_results
+        matchCount >= max_results
           ? `\n… reached the limit of ${max_results} matches.`
           : "";
 
-      return text(
-        `Found ${hits.length} matches in ${filesScanned} files:\n\n` +
-          hits.join("\n") +
-          suffix,
-      );
+      let output =
+        `Found ${matchCount} matches in ${filesScanned} files:\n\n` +
+        blocks.join("\n\n") +
+        suffix;
+
+      if (output.length > MAX_OUTPUT_CHARS) {
+        output =
+          output.slice(0, MAX_OUTPUT_CHARS) +
+          `\n… output truncated to ${MAX_OUTPUT_CHARS} characters.`;
+      }
+
+      return text(output);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "replace_in_files",
+  {
+    title: "Replace text in many files",
+    description:
+      "Replaces every occurrence of a string (or regular expression) across " +
+      "text files, with a backup of each changed file and a single undo step. " +
+      "Skips binary and very large files, node_modules, .git and .mcp by " +
+      "default. Use dry_run=true to preview the changes first.",
+    inputSchema: {
+      query: z.string().min(1).describe("Text or regular expression to find"),
+      replacement: z.string().describe("Replacement text (may be empty)"),
+      path: z.string().default(".").describe("Where to search (defaults to root)"),
+      include: z
+        .string()
+        .optional()
+        .describe("File glob, e.g. `*.js` or `src/**/*.ts`"),
+      is_regex: z.boolean().default(false).describe("Treat query as a regular expression"),
+      case_sensitive: z.boolean().default(false).describe("Match case"),
+      dry_run: z
+        .boolean()
+        .default(false)
+        .describe("Only report what would change; do not write files"),
+      max_files: z
+        .number()
+        .int()
+        .min(1)
+        .max(2000)
+        .default(200)
+        .describe("Stop after changing this many files"),
+      max_file_size: z
+        .number()
+        .int()
+        .min(1)
+        .default(1_000_000)
+        .describe("Skip files larger than this size (bytes)"),
+      ignore: z
+        .array(z.string())
+        .default([])
+        .describe("Additional names/globs to skip"),
+    },
+  },
+  async ({
+    query,
+    replacement,
+    path: inputPath,
+    include,
+    is_regex,
+    case_sensitive,
+    dry_run,
+    max_files,
+    max_file_size,
+    ignore,
+  }) => {
+    try {
+      const start = resolvePath(inputPath);
+      const stat = await statOrNull(start);
+      if (!stat?.isDirectory()) throw new Error(`Folder not found: ${start}`);
+
+      let matcher;
+      try {
+        matcher = new RegExp(
+          is_regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+          `${case_sensitive ? "" : "i"}g`,
+        );
+      } catch (e) {
+        throw new Error(`Invalid regular expression: ${e.message}`);
+      }
+
+      const includeRegex = include ? globToRegExp(include) : null;
+      const candidates = [];
+      let filesScanned = 0;
+      let filesSkipped = 0;
+      let totalMatches = 0;
+      let stopped = false;
+
+      await walkTree(start, {
+        maxDepth: 30,
+        extraIgnore: ignore,
+        onFile: async (full, entry) => {
+          if (stopped) return;
+          const rel = normalizeRel(path.relative(start, full));
+          if (includeRegex && !includeRegex.test(rel) && !includeRegex.test(entry.name)) {
+            return;
+          }
+
+          let fileStat;
+          try {
+            fileStat = await fs.stat(full);
+          } catch {
+            return;
+          }
+          if (fileStat.size > max_file_size) {
+            filesSkipped += 1;
+            return;
+          }
+
+          let buf;
+          try {
+            buf = await fs.readFile(full);
+          } catch {
+            filesSkipped += 1;
+            return;
+          }
+          if (isProbablyBinary(buf)) {
+            filesSkipped += 1;
+            return;
+          }
+
+          filesScanned += 1;
+          const before = buf.toString("utf8");
+          const matches = before.match(matcher);
+          if (!matches || !matches.length) return;
+
+          const after = before.replace(matcher, () => replacement);
+          if (after === before) return;
+
+          candidates.push({ abs: full, rel, count: matches.length, before, after });
+          totalMatches += matches.length;
+
+          if (candidates.length >= max_files) stopped = true;
+        },
+      });
+
+      if (!candidates.length) {
+        return text(
+          `No changes: "${query}" was not found in ${filesScanned} scanned file(s) in ${start}.`,
+        );
+      }
+
+      const lines = [];
+      for (const item of candidates) {
+        lines.push(`  ${item.rel} (${item.count})`);
+        const beforeLines = item.before.split(/\r?\n/);
+        const afterLines = item.after.split(/\r?\n/);
+        for (let i = 0; i < Math.max(beforeLines.length, afterLines.length); i += 1) {
+          if (beforeLines[i] !== afterLines[i]) {
+            const clip = (value) =>
+              value === undefined
+                ? "(end of file)"
+                : value.length > 160
+                  ? value.slice(0, 160) + "…"
+                  : value;
+            lines.push(`    line ${i + 1}: - ${clip(beforeLines[i])}`);
+            lines.push(`               + ${clip(afterLines[i])}`);
+            break;
+          }
+        }
+      }
+
+      const summary =
+        `${dry_run ? "Would replace" : "Replaced"} ${totalMatches} occurrence(s) ` +
+        `in ${candidates.length} file(s)` +
+        (stopped ? ` (stopped at the ${max_files}-file limit)` : "") +
+        `:\n\n${lines.join("\n")}`;
+
+      if (dry_run) {
+        return text(`${summary}\n\nNo files were changed (dry_run).`);
+      }
+
+      const changes = [];
+      try {
+        for (const item of candidates) {
+          const backup = await backupFile(item.abs);
+          if (!backup) throw new Error(`Could not back up ${item.abs}`);
+          await fs.writeFile(item.abs, item.after, "utf8");
+          changes.push({ target: item.abs, backup });
+        }
+      } finally {
+        if (changes.length) {
+          await recordActivity(
+            "replace_in_files",
+            `Replace "${query}" in ${changes.length} file(s)`,
+            { kind: "restore_files", items: changes },
+          );
+        }
+      }
+
+      return text(`${summary}\n\nUndo with undo_last_change().`);
     } catch (e) {
       return fail(e);
     }
@@ -1663,6 +2793,19 @@ server.registerTool(
             await fs.mkdir(path.dirname(undo.target), { recursive: true });
             await fs.copyFile(undo.backup, undo.target);
             await fs.rm(undo.backup, { force: true });
+          } else if (undo.kind === "restore_files") {
+            const restoreItems = Array.isArray(undo.items) ? undo.items : [];
+            if (!restoreItems.length) throw new Error("nothing to restore");
+            for (const item of restoreItems) {
+              if (!(await statOrNull(item.backup))) {
+                throw new Error(`backup not found for ${shortName(item.target)}`);
+              }
+            }
+            for (const item of restoreItems) {
+              await fs.mkdir(path.dirname(item.target), { recursive: true });
+              await fs.copyFile(item.backup, item.target);
+              await fs.rm(item.backup, { force: true });
+            }
           } else if (undo.kind === "remove") {
             const stat = await statOrNull(undo.target);
             if (stat) {
@@ -1789,6 +2932,158 @@ if (ALLOW_SHELL) {
       }
     },
   );
+
+  server.registerTool(
+    "start_process",
+    {
+      title: "Start a background command",
+      description:
+        "Starts a shell command in the background and returns an id. Use " +
+        "read_output to fetch what it prints and stop_process to stop it. " +
+        "Good for dev servers, watchers and long builds that must keep running. " +
+        "The process keeps running until stopped or until the server exits.",
+      inputSchema: {
+        command: z.string().min(1).describe("Command line, e.g. `npm run dev`"),
+        cwd: z
+          .string()
+          .default(".")
+          .describe("Working folder (relative to the root, or absolute inside it)"),
+      },
+    },
+    async ({ command, cwd }) => {
+      try {
+        if (!command.trim()) throw new Error("The command is empty.");
+        if (command.includes("\u0000")) throw new Error("The command contains a NUL byte.");
+
+        const absCwd = resolvePath(cwd);
+        const stat = await statOrNull(absCwd);
+        if (!stat) throw new Error(`Folder not found: ${absCwd}`);
+        if (!stat.isDirectory()) throw new Error(`Not a folder: ${absCwd}`);
+
+        const record = startBackgroundProcess(command, absCwd);
+        return text(
+          `Started background process ${record.id} (pid ${record.pid}).\n` +
+            `$ ${command}\nshell: ${record.shell} · folder: ${absCwd}\n\n` +
+            `Read: read_output({ id: "${record.id}" })\n` +
+            `Stop: stop_process({ id: "${record.id}" })`,
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "read_output",
+    {
+      title: "Read background process output",
+      description:
+        "Returns what a process started with start_process has printed so far, " +
+        "plus its status and exit code. Set wait_ms to wait for the process to " +
+        "finish (useful for builds). Set clear=true to drop the buffered output " +
+        "after reading it.",
+      inputSchema: {
+        id: z.string().min(1).describe("Process id from start_process"),
+        wait_ms: z
+          .number()
+          .int()
+          .min(0)
+          .max(30_000)
+          .default(0)
+          .describe("Wait up to this many milliseconds for the process to finish"),
+        clear: z
+          .boolean()
+          .default(false)
+          .describe("Clear the buffered stdout/stderr after reading"),
+      },
+    },
+    async ({ id, wait_ms, clear }) => {
+      try {
+        const record = BACKGROUND.get(id);
+        if (!record) throw new Error(`No background process with id "${id}".`);
+
+        if (wait_ms > 0) await waitForExit(record, wait_ms);
+
+        const output = formatProcessOutput(record);
+        if (clear) {
+          record.stdout = "";
+          record.stderr = "";
+          record.stdoutTruncated = false;
+          record.stderrTruncated = false;
+        }
+        return text(output);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "stop_process",
+    {
+      title: "Stop a background process",
+      description:
+        "Stops a process started with start_process, killing its whole process " +
+        "tree, and returns the final output.",
+      inputSchema: {
+        id: z.string().min(1).describe("Process id from start_process"),
+      },
+    },
+    async ({ id }) => {
+      try {
+        const record = BACKGROUND.get(id);
+        if (!record) throw new Error(`No background process with id "${id}".`);
+
+        if (!record.finished) {
+          killProcessTree(record.pid);
+          await waitForExit(record, 5_000);
+        }
+
+        return text(
+          (record.finished
+            ? "Process stopped."
+            : "Stop signal sent, but the process has not exited yet.") +
+            `\n\n${formatProcessOutput(record)}`,
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_processes",
+    {
+      title: "List background processes",
+      description: "Lists processes started with start_process in this session.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const records = [...BACKGROUND.values()].sort(
+          (a, b) => a.startedAt - b.startedAt,
+        );
+        if (!records.length) return text("No background processes.");
+
+        const lines = records.map((record) => {
+          const endedAt = record.finished ? record.endedAt : Date.now();
+          const elapsed = ((endedAt - record.startedAt) / 1000).toFixed(1);
+          const state = record.finished
+            ? `finished (exit ${record.exitCode ?? "?"})`
+            : "running";
+          return (
+            `${record.id}  ${state}  ${elapsed}s\n` +
+            `  $ ${record.command}\n` +
+            `  folder: ${shortName(record.cwd)}`
+          );
+        });
+
+        return text(`${records.length} process(es):\n\n${lines.join("\n\n")}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1797,12 +3092,14 @@ if (ALLOW_SHELL) {
 
 async function main() {
   if (!ALLOW_OUTSIDE) {
-    try {
-      await fs.access(ROOT, fsConstants.R_OK | fsConstants.W_OK);
-    } catch {
-      console.error(
-        `[claude-file-manager] Warning: no read/write access to ${ROOT}.`,
-      );
+    for (const root of ROOTS) {
+      try {
+        await fs.access(root, fsConstants.R_OK | fsConstants.W_OK);
+      } catch {
+        console.error(
+          `[claude-file-manager] Warning: no read/write access to ${root}.`,
+        );
+      }
     }
   }
 
@@ -1810,18 +3107,28 @@ async function main() {
   await server.connect(transport);
 
   // Do not write to stdout — it is the protocol channel.
-  console.error(`[claude-file-manager] started. Root: ${ROOT}`);
+  console.error(
+    `[claude-file-manager] started. Allowed folder(s):\n${ROOTS.map((root) => `  • ${root}`).join("\n")}`,
+  );
   console.error(`[claude-file-manager] trash and backups: ${DATA_DIR}`);
   if (ALLOW_OUTSIDE) {
     console.error(
-      "[claude-file-manager] MCP_ALLOW_OUTSIDE_ROOT=1 — paths outside the root are allowed.",
+      "[claude-file-manager] MCP_ALLOW_OUTSIDE_ROOT=1 — paths outside the allowed folders are allowed.",
     );
   }
   if (ALLOW_SHELL) {
     console.error(
-      `[claude-file-manager] MCP_ALLOW_SHELL=1 — the run_command terminal tool is enabled (shell: ${SHELL_MODE}).`,
+      `[claude-file-manager] MCP_ALLOW_SHELL=1 — terminal tools are enabled (shell: ${SHELL_MODE}).`,
     );
   }
+}
+
+process.on("exit", stopAllProcesses);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    stopAllProcesses();
+    process.exit(0);
+  });
 }
 
 main().catch((error) => {

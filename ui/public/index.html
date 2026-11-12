@@ -21,6 +21,18 @@
       <div class="status"><span class="dot"></span> runs locally</div>
     </header>
 
+    <div id="updateBanner" class="update-banner" role="status" hidden>
+      <div class="update-text">
+        <strong id="updateTitle"></strong>
+        <span id="updateMeta" class="muted"></span>
+      </div>
+      <div class="update-actions">
+        <a id="updateDownload" class="update-link primary" target="_blank" rel="noopener noreferrer" hidden>Download</a>
+        <a id="updateLink" class="update-link ghost" target="_blank" rel="noopener noreferrer">Release notes</a>
+        <button id="updateDismiss" class="ghost" type="button">Later</button>
+      </div>
+    </div>
+
     <main class="layout">
       <section class="card">
         <div class="card-head">
@@ -59,6 +71,28 @@
           <div class="sel-actions">
             <button id="openFolder" class="ghost" type="button">Open</button>
             <button id="pick" class="primary" type="button">Use this folder</button>
+          </div>
+        </div>
+
+        <div class="roots">
+          <div class="roots-head">
+            <span class="label">Additional folders</span>
+            <span class="muted">
+              Optional. Claude can also read and change files in these folders.
+            </span>
+          </div>
+          <div id="extraRoots" class="root-list"></div>
+          <div class="roots-add">
+            <input
+              id="extraRootInput"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="Folder path, e.g. D:\Projects"
+              aria-label="Additional folder path"
+            />
+            <button id="addRoot" class="ghost" type="button">Add</button>
+            <button id="addCurrentRoot" class="ghost" type="button">Add current folder</button>
           </div>
         </div>
       </section>
@@ -122,11 +156,46 @@
           <pre id="preview"></pre>
         </details>
       </section>
+
+      <section class="card history-card">
+        <div class="card-head">
+          <h2>3. History and recovery</h2>
+          <p class="muted">
+            What the server deleted, backed up, ran and changed. Restore items
+            with one click — the same trash and backups Claude uses.
+          </p>
+        </div>
+
+        <div class="tabs" role="tablist" aria-label="History sections">
+          <button class="tab active" type="button" role="tab" data-tab="trash">
+            Trash <span class="count" id="countTrash">0</span>
+          </button>
+          <button class="tab" type="button" role="tab" data-tab="backups">
+            Backups <span class="count" id="countBackups">0</span>
+          </button>
+          <button class="tab" type="button" role="tab" data-tab="commands">
+            Commands <span class="count" id="countCommands">0</span>
+          </button>
+          <button class="tab" type="button" role="tab" data-tab="activity">
+            Activity <span class="count" id="countActivity">0</span>
+          </button>
+        </div>
+
+        <div id="historyBody" class="history-body"></div>
+
+        <div class="history-foot">
+          <span id="historyDataDir" class="muted"></span>
+          <button id="refreshHistory" class="ghost" type="button">Refresh</button>
+        </div>
+      </section>
     </main>
 
     <footer class="footer">
-      Data never leaves your computer. The UI is reachable only on
-      127.0.0.1.
+      Your files and settings never leave your computer. The UI is reachable only on
+      127.0.0.1. The only network request is the update check on GitHub
+      (set UI_NO_UPDATE_CHECK=1 to turn it off).
+      <span id="appVersion" class="muted"></span>
+      <button id="checkUpdate" class="linkish" type="button">Check for updates</button>
     </footer>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
