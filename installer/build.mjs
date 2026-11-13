@@ -273,6 +273,38 @@ async function makePortableZip() {
   return zip;
 }
 
+/**
+ * Portable build for macOS and Linux. Node_modules are pure JavaScript
+ * (no native modules), so the only requirement on the target machine is
+ * Node.js 18+. The zip is written with bsdtar, not Compress-Archive:
+ * bsdtar stores forward-slash entry names that macOS Archive Utility
+ * and unzip open correctly.
+ */
+async function makeMacZip() {
+  const staging = path.join(BUILD_DIR, "mac", "claude-file-manager");
+  await fs.rm(path.join(BUILD_DIR, "mac"), { recursive: true, force: true });
+  await fs.mkdir(staging, { recursive: true });
+
+  for (const item of ["src", "package.json", "package-lock.json", "README.md", "LICENSE", "start-ui.command"]) {
+    await fs.cp(path.join(ROOT, item), path.join(staging, item), { recursive: true });
+  }
+  await fs.mkdir(path.join(staging, "ui"), { recursive: true });
+  await fs.cp(path.join(ROOT, "ui", "public"), path.join(staging, "ui", "public"), { recursive: true });
+  await fs.copyFile(path.join(ROOT, "ui", "server.js"), path.join(staging, "ui", "server.js"));
+  await fs.cp(path.join(APP_DIR, "node_modules"), path.join(staging, "node_modules"), { recursive: true });
+
+  await fs.mkdir(OUT_DIR, { recursive: true });
+  const zip = path.join(OUT_DIR, `ClaudeFileManager-Portable-${VERSION}-macOS.zip`);
+  await fs.rm(zip, { force: true });
+  await run("C:\\Windows\\System32\\tar.exe", [
+    "-a", "-cf", zip, "-C", path.dirname(staging), path.basename(staging),
+  ]);
+
+  const stat = await fs.stat(zip);
+  console.log(`  Portable macOS/Linux: ${zip} (${formatMb(stat.size)})`);
+  return zip;
+}
+
 async function makeInstaller(instructionFile) {
   const iscc = findIscc();
   if (!iscc) {
@@ -327,6 +359,9 @@ async function main() {
 
   console.log("• Creating the portable archive…");
   await makePortableZip();
+
+  console.log("• Creating the macOS/Linux archive…");
+  await makeMacZip();
 
   console.log("• Building the installer…");
   await makeInstaller(instructionFile);

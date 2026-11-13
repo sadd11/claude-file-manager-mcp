@@ -1698,7 +1698,7 @@ function stopAllProcesses() {
 
 const server = new McpServer({
   name: "claude-file-manager",
-  version: "1.4.0",
+  version: "1.4.1",
 });
 
 /**
@@ -4029,7 +4029,7 @@ server.registerResource(
         mimeType: "application/json",
         text: JSON.stringify(
           {
-            version: "1.4.0",
+            version: "1.4.1",
             roots: ROOTS,
             dataDir: DATA_DIR,
             allowOutside: ALLOW_OUTSIDE,

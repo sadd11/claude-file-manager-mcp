@@ -45,7 +45,7 @@ files only.
 
 ## Windows installation (prebuilt installer)
 
-Download **[ClaudeFileManager-Setup-1.3.1.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
+Download **[ClaudeFileManager-Setup-1.4.1.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
 
 1. Run the installer. If Windows shows the blue SmartScreen window, click
    **More info → Run anyway** (the file has no digital signature).
@@ -60,8 +60,47 @@ Download **[ClaudeFileManager-Setup-1.3.1.exe](https://github.com/sadd11/claude-
 "Claude File Manager" shortcuts appear in the Start menu and (optionally) on
 the desktop. Uninstall via **Settings → Apps**.
 
-**Portable version:** **[ClaudeFileManager-Portable-1.3.1.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
+**Portable version:** **[ClaudeFileManager-Portable-1.4.1.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
 extract anywhere and run `start-ui.cmd`. No installation required.
+
+## macOS and Linux
+
+There is no installer for macOS, but there is a portable build:
+**[ClaudeFileManager-Portable-1.4.1-macOS.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**
+(also works on Linux). Node.js 18+ is the only requirement — `brew install node`
+on macOS, or your package manager on Linux.
+
+1. Unzip it anywhere (for example `~/claude-file-manager`).
+2. In Terminal: `cd` into the folder and run `sh start-ui.command`
+   (or `chmod +x start-ui.command` once, then double-click it).
+   If macOS Gatekeeper complains about a downloaded script, right-click the
+   file → **Open**, or just run it with `sh` as above.
+3. The setup page `http://127.0.0.1:4317` opens — pick a folder and click
+   **Connect to Claude Desktop**. The UI writes the config to
+   `~/Library/Application Support/Claude/claude_desktop_config.json`
+   (creating a backup first) and shows the JSON for manual editing.
+4. Fully quit Claude Desktop (⌘Q) and reopen it.
+
+Manual config for macOS:
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "node",
+      "args": ["/Users/you/claude-file-manager/src/index.js"],
+      "env": {
+        "MCP_FILE_ROOT": "/Users/you/your-project"
+      }
+    }
+  }
+}
+```
+
+On macOS/Linux several roots are separated by `:` in `MCP_FILE_ROOTS`, and the
+terminal tool runs commands through `/bin/sh` (`MCP_SHELL=bash` for bash).
+Everything else — tools, trash, backups, undo, the setup UI — is identical.
+Every push is smoke-tested on macOS, Linux and Windows runners in CI.
 
 ### Building the installer
 
@@ -71,8 +110,8 @@ npm run build:installer
 ```
 
 The output appears in `installer\out`. The script copies the Node runtime,
-installs production dependencies, draws the icon and builds both the `.exe`
-and the portable `.zip`.
+installs production dependencies, draws the icon and builds the `.exe`, the
+Windows portable `.zip` and the macOS/Linux portable `.zip`.
 
 ## Run from source
 
@@ -332,6 +371,14 @@ If you need access to the whole disk, set `MCP_ALLOW_OUTSIDE_ROOT=1`. Do this
 consciously: Claude will be able to change any file your user has rights to.
 
 ## Development
+
+```powershell
+npm test
+```
+
+Runs a cross-platform smoke test against a real server instance (28 tools,
+read guards, undo, zip, PDF, notebooks, resources, elicitation). The same test
+runs on macOS, Linux and Windows in CI on every push.
 
 ```powershell
 npm run inspect

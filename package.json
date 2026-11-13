@@ -1,6 +1,6 @@
 {
   "name": "claude-file-manager-mcp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "MCP server for creating, reading, editing and deleting files and folders, with an optional terminal tool",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "ui": "node ui/server.js",
+    "test": "node test/smoke.mjs",
     "build:installer": "node installer/build.mjs",
     "inspect": "npx @modelcontextprotocol/inspector node src/index.js"
   },
