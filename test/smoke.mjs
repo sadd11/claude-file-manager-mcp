@@ -241,7 +241,7 @@ try {
   );
   const cfg = await request("resources/read", { uri: "file-manager://config" });
   const cfgText = cfg.result?.contents?.[0]?.text ?? "";
-  check("config resource", cfgText.includes(IS_WIN ? "1.4.1" : "1.4.1") && cfgText.includes("allowShell"), cfgText.slice(0, 200));
+  check("config resource", cfgText.includes("1.4.2") && cfgText.includes("allowShell"), cfgText.slice(0, 200));
   const treeRes = await request("resources/read", { uri: "file-manager://tree" });
   check("tree resource", (treeRes.result?.contents?.[0]?.text ?? "").includes("Tree:"), "");
 

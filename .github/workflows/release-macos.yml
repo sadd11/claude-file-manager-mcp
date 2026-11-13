@@ -1,0 +1,35 @@
+name: macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm ci --omit=dev --no-audit --no-fund
+      - name: Build the app bundle and DMG
+        run: node installer/macos.mjs
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: installer/out/*.dmg
+          if-no-files-found: error
+      - name: Attach the DMG to the tag release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" installer/out/*.dmg \
+            --repo "$GITHUB_REPOSITORY" --clobber

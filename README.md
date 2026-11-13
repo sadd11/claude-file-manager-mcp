@@ -45,7 +45,7 @@ files only.
 
 ## Windows installation (prebuilt installer)
 
-Download **[ClaudeFileManager-Setup-1.4.1.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
+Download **[ClaudeFileManager-Setup-1.4.2.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
 
 1. Run the installer. If Windows shows the blue SmartScreen window, click
    **More info → Run anyway** (the file has no digital signature).
@@ -60,14 +60,36 @@ Download **[ClaudeFileManager-Setup-1.4.1.exe](https://github.com/sadd11/claude-
 "Claude File Manager" shortcuts appear in the Start menu and (optionally) on
 the desktop. Uninstall via **Settings → Apps**.
 
-**Portable version:** **[ClaudeFileManager-Portable-1.4.1.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
+**Portable version:** **[ClaudeFileManager-Portable-1.4.2.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
 extract anywhere and run `start-ui.cmd`. No installation required.
 
 ## macOS and Linux
 
-There is no installer for macOS, but there is a portable build:
-**[ClaudeFileManager-Portable-1.4.1-macOS.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**
-(also works on Linux). Node.js 18+ is the only requirement — `brew install node`
+There are two ways to install on macOS:
+
+### DMG installer (drag to Applications)
+
+Download **[ClaudeFileManager-1.4.2.dmg](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**,
+open it and drag **Claude File Manager** onto the **Applications** folder.
+The app bundles its own Node.js — nothing else needs to be installed.
+
+Opening it starts the local setup page (`http://127.0.0.1:4317`) in your
+browser: pick a folder and click **Connect to Claude Desktop**, then fully
+quit (⌘Q) and reopen Claude Desktop.
+
+The app is not signed with an Apple Developer certificate, so macOS will ask
+for a one-time confirmation. If it refuses to open, run once in Terminal:
+
+```bash
+xattr -cr "/Applications/Claude File Manager.app"
+```
+
+and open it again.
+
+### Portable (macOS and Linux)
+
+**[ClaudeFileManager-Portable-1.4.2-macOS.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**
+also works on Linux. Node.js 18+ is the only requirement — `brew install node`
 on macOS, or your package manager on Linux.
 
 1. Unzip it anywhere (for example `~/claude-file-manager`).
