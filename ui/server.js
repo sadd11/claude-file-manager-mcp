@@ -737,13 +737,31 @@ async function restoreTrash(id, overwrite) {
     throw new Error(`The original path is outside the allowed folders: ${item.originalPath}`);
   }
 
+  let replacedId = null;
   if (await statOrNull(item.originalPath)) {
     if (!overwrite) {
       throw new Error(
         `Something already exists at ${item.originalPath}. Confirm replacing it to continue.`,
       );
     }
-    await fs.rm(item.originalPath, { recursive: true, force: true });
+    // The previous item goes to the trash too, the same way the MCP server
+    // handles it — an accidental overwrite stays reversible.
+    const trashId = `${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
+    const trashedPath = path.join(
+      dataDir(),
+      "trash",
+      `${trashId}__${path.basename(item.originalPath)}`,
+    );
+    await fs.mkdir(path.dirname(trashedPath), { recursive: true });
+    await moveItem(item.originalPath, trashedPath);
+    items.push({
+      id: trashId,
+      originalPath: item.originalPath,
+      trashPath: trashedPath,
+      type: item.type,
+      deletedAt: new Date().toISOString(),
+    });
+    replacedId = trashId;
   }
 
   await fs.mkdir(path.dirname(item.originalPath), { recursive: true });
@@ -757,7 +775,7 @@ async function restoreTrash(id, overwrite) {
     target: item.originalPath,
   });
 
-  return item;
+  return { ...item, replacedId };
 }
 
 async function restoreBackup(name) {
@@ -1098,10 +1116,21 @@ async function handleApi(req, res, url) {
     }
     try {
       const item = await restoreTrash(body.id.trim(), Boolean(body.overwrite));
-      return sendJson(res, 200, { ok: true, restored: item.originalPath });
+      return sendJson(res, 200, {
+        ok: true,
+        restored: item.originalPath,
+        replacedTrashId: item.replacedId,
+      });
     } catch (e) {
-      const status = /already exists/i.test(e.message) ? 409 : 404;
-      return sendJson(res, status, { error: e.message });
+      const message = e instanceof Error ? e.message : String(e);
+      const status = /already exists/i.test(message)
+        ? 409
+        : /outside the allowed folders/i.test(message)
+          ? 403
+          : /No trash entry|no longer in the trash/i.test(message)
+            ? 404
+            : 400;
+      return sendJson(res, status, { error: message });
     }
   }
 

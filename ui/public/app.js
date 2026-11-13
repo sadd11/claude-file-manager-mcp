@@ -324,11 +324,15 @@ function makeRestoreButton(label, handler) {
 
 async function restoreTrashEntry(id) {
   try {
-    await api("/api/trash/restore", {
+    const result = await api("/api/trash/restore", {
       method: "POST",
       body: JSON.stringify({ id }),
     });
-    toast("Restored from the trash");
+    toast(
+      result.replacedTrashId
+        ? "Restored — the replaced item was moved to the trash"
+        : "Restored from the trash",
+    );
     await loadHistory();
   } catch (e) {
     if (/already exists/i.test(e.message) && confirm(`${e.message}\n\nReplace it?`)) {

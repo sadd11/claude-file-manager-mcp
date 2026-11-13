@@ -22,13 +22,15 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import fs from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 /**
  * Allowed folders. MCP_FILE_ROOTS is a list separated by the platform path
@@ -66,6 +68,7 @@ const SHELL_TIMEOUT_MAX = 300_000;
 const MAX_BG_PROCESSES = Number(process.env.MCP_MAX_PROCESSES || 8);
 const MAX_PROCESS_BUFFER = Number(process.env.MCP_MAX_PROCESS_BUFFER || 100_000);
 const MAX_ARCHIVE_BYTES = Number(process.env.MCP_MAX_ARCHIVE_BYTES || 500_000_000);
+const REQUIRE_READ = !/^(0|false|no)$/i.test(process.env.MCP_REQUIRE_READ || "");
 
 const DATA_DIR = process.env.MCP_DATA_DIR
   ? path.resolve(process.env.MCP_DATA_DIR)
@@ -98,6 +101,57 @@ function insideRoots(abs) {
   return rootOf(abs) !== null;
 }
 
+/** Path equality that ignores letter case on Windows. */
+function pathsEqual(a, b) {
+  return process.platform === "win32"
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
+function isRootPath(abs) {
+  return ROOTS.some((root) => pathsEqual(root, abs));
+}
+
+/** True when target equals dir or lies anywhere inside it. */
+function insideDir(target, dir) {
+  const rel = path.relative(dir, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function realpathOrNull(target) {
+  try {
+    // realpathSync lives on node:fs, not on the promises API imported above.
+    return realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Realpath of the deepest existing ancestor of a path. Needed for paths that
+ * do not exist yet (a fresh write_file target): a symlink can only hide among
+ * the path parts that are already on disk.
+ */
+function deepestExistingRealpath(abs) {
+  let current = abs;
+  for (let depth = 0; depth < 40; depth += 1) {
+    const real = realpathOrNull(current);
+    if (real) return real;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+let rootRealPathsCache = null;
+function rootRealPaths() {
+  if (!rootRealPathsCache) {
+    rootRealPathsCache = ROOTS.map((root) => realpathOrNull(root) || root);
+  }
+  return rootRealPathsCache;
+}
+
 function formatRootList() {
   return ROOTS.map((root) => `  • ${root}`).join("\n");
 }
@@ -112,29 +166,46 @@ function resolvePath(input, { allowRoot = true } = {}) {
     ? path.resolve(target)
     : path.resolve(ROOT, target);
 
-  if (!allowRoot && ROOTS.includes(abs)) {
+  if (!allowRoot && isRootPath(abs)) {
     throw new Error(`A root folder cannot be modified: ${abs}`);
   }
 
-  if (!ALLOW_OUTSIDE && !insideRoots(abs)) {
-    throw new Error(
-      `Path is outside the allowed folders: ${abs}\nAllowed folders:\n${formatRootList()}\n` +
-        `To allow other paths, set MCP_ALLOW_OUTSIDE_ROOT=1.`,
-    );
+  if (!ALLOW_OUTSIDE) {
+    if (!insideRoots(abs)) {
+      throw new Error(
+        `Path is outside the allowed folders: ${abs}\nAllowed folders:\n${formatRootList()}\n` +
+          `To allow other paths, set MCP_ALLOW_OUTSIDE_ROOT=1.`,
+      );
+    }
+    // A symbolic link inside a root can point anywhere. Follow what already
+    // exists on disk and reject the path if it lands outside every root.
+    const real = deepestExistingRealpath(abs);
+    if (
+      real &&
+      !insideRoots(real) &&
+      !rootRealPaths().some((root) => insideDir(real, root))
+    ) {
+      throw new Error(
+        `Path escapes the allowed folders through a symbolic link: ${abs}\n` +
+          `Remove or rename the symlink, or point it inside the allowed folders.`,
+      );
+    }
   }
 
   return abs;
 }
 
 function assertNotData(abs) {
-  for (const dir of PROTECTED_DIRS) {
-    const rel = path.relative(dir, abs);
-    const inside =
-      abs === dir || (!rel.startsWith("..") && !path.isAbsolute(rel) && rel !== "");
-    if (inside) {
-      throw new Error(
-        `Service folder ${dir} is protected: it contains the trash and backups.`,
-      );
+  const targets = [abs];
+  const real = deepestExistingRealpath(abs);
+  if (real && real !== abs) targets.push(real);
+  for (const target of targets) {
+    for (const dir of PROTECTED_DIRS) {
+      if (insideDir(target, dir)) {
+        throw new Error(
+          `Service folder ${dir} is protected: it contains the trash and backups.`,
+        );
+      }
     }
   }
 }
@@ -237,6 +308,36 @@ async function backupFile(abs) {
   return dest;
 }
 
+/* ------------------------- read-before-modify state ----------------------- */
+
+const READ_STATE = new Map(); // absolute path -> mtimeMs at the last read
+
+function noteRead(abs, stat) {
+  if (stat && Number.isFinite(stat.mtimeMs)) READ_STATE.set(abs, stat.mtimeMs);
+}
+
+/**
+ * Claude-Code-style guard: a file must be read in this session, and must not
+ * have changed since that read, before it can be modified. Turn it off with
+ * MCP_REQUIRE_READ=0.
+ */
+function requireReadBeforeModify(abs, stat, action) {
+  if (!REQUIRE_READ) return;
+  const seen = READ_STATE.get(abs);
+  if (seen === undefined) {
+    throw new Error(
+      `Refusing to ${action} ${abs}: it was not read in this session.\n` +
+        `Read it with read_file first, then retry.`,
+    );
+  }
+  if (stat && Number.isFinite(stat.mtimeMs) && stat.mtimeMs !== seen) {
+    throw new Error(
+      `${abs} changed since the last read (edited outside the server?).\n` +
+        `Read it again with read_file, then retry.`,
+    );
+  }
+}
+
 /* ---------------------------------- trash --------------------------------- */
 
 async function moveToTrash(abs, type) {
@@ -282,6 +383,7 @@ async function restoreTrashItem(id, overwrite = false) {
   if (!item) throw new Error(`No trash entry with id "${id}".`);
 
   const destStat = await statOrNull(item.originalPath);
+  let replacedTrashId = null;
   if (destStat) {
     if (!overwrite) {
       throw new Error(
@@ -289,7 +391,13 @@ async function restoreTrashItem(id, overwrite = false) {
           `Set overwrite=true to replace it.`,
       );
     }
-    await fs.rm(item.originalPath, { recursive: true, force: true });
+    // The previous item goes to the trash too, so an accidental overwrite
+    // stays reversible (and is not lost if the rename below fails).
+    const replaced = await moveToTrash(
+      item.originalPath,
+      destStat.isDirectory() ? "directory" : "file",
+    );
+    replacedTrashId = replaced.id;
   }
 
   await fs.mkdir(path.dirname(item.originalPath), { recursive: true });
@@ -303,7 +411,7 @@ async function restoreTrashItem(id, overwrite = false) {
   }
 
   await takeTrashItem(id);
-  return item;
+  return { ...item, replacedTrashId };
 }
 
 /* ----------------------------- glob / traversal --------------------------- */
@@ -346,6 +454,36 @@ function hasWildcard(value) {
 function normalizeRel(p) {
   return p.split(path.sep).join("/");
 }
+
+/** Shortcut extension groups for the `type` parameter of search tools. */
+const FILE_TYPES = {
+  js: [".js", ".mjs", ".cjs", ".jsx"],
+  ts: [".ts", ".tsx", ".mts", ".cts"],
+  python: [".py", ".pyw", ".pyi"],
+  go: [".go"],
+  rust: [".rs"],
+  java: [".java"],
+  kotlin: [".kt", ".kts"],
+  ruby: [".rb"],
+  php: [".php"],
+  c: [".c", ".h"],
+  cpp: [".cc", ".cpp", ".cxx", ".hpp", ".hh"],
+  csharp: [".cs"],
+  swift: [".swift"],
+  scala: [".scala"],
+  sh: [".sh", ".bash", ".zsh"],
+  powershell: [".ps1", ".psm1"],
+  css: [".css", ".scss", ".sass"],
+  html: [".html", ".htm"],
+  xml: [".xml", ".svg"],
+  json: [".json"],
+  yaml: [".yml", ".yaml"],
+  toml: [".toml"],
+  ini: [".ini", ".cfg", ".conf"],
+  sql: [".sql"],
+  md: [".md", ".markdown"],
+  text: [".txt", ".log"],
+};
 
 async function walkTree(start, options) {
   const {
@@ -489,13 +627,19 @@ function dosDateTime(date) {
   };
 }
 
-async function collectZipEntries(sources) {
+async function collectZipEntries(sources, { exclude } = {}) {
   const entries = [];
   const names = new Set();
   let totalBytes = 0;
   let skippedLinks = 0;
+  let skippedSelf = 0;
 
   function push(entry) {
+    if (entries.length >= 20_000) {
+      throw new Error(
+        "Too many entries to zip (max 20000). Zip fewer files or subfolders.",
+      );
+    }
     if (names.has(entry.name)) {
       throw new Error(
         `Duplicate archive entry "${entry.name}". Two sources have the same name — rename one of them.`,
@@ -506,6 +650,10 @@ async function collectZipEntries(sources) {
   }
 
   async function add(abs, name) {
+    if (exclude && pathsEqual(abs, exclude)) {
+      skippedSelf += 1;
+      return;
+    }
     const stat = await statOrNull(abs);
     if (!stat) throw new Error(`Source not found: ${abs}`);
     if (stat.isSymbolicLink()) {
@@ -539,7 +687,7 @@ async function collectZipEntries(sources) {
 
   for (const source of sources) {
     const abs = resolvePath(source);
-    if (ROOTS.includes(abs)) {
+    if (isRootPath(abs)) {
       throw new Error(
         `Refusing to zip a whole root folder (${abs}). Zip its subfolders instead.`,
       );
@@ -550,7 +698,7 @@ async function collectZipEntries(sources) {
     await add(abs, base);
   }
 
-  return { entries, totalBytes, skippedLinks };
+  return { entries, totalBytes, skippedLinks, skippedSelf };
 }
 
 async function writeZip(entries, destination) {
@@ -806,6 +954,284 @@ async function extractZip(archive, destination, overwrite) {
   return { files, folders, bytes, entries: planned.length };
 }
 
+/* ---------------------------------- pdf ----------------------------------- */
+
+/*
+ * Best-effort text extraction for simple text-based PDFs, without external
+ * dependencies. Scanned pages (images) and exotic font encodings yield
+ * little or no text; the tool then says so instead of failing.
+ */
+
+function pdfUnescape(raw) {
+  let out = "";
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = raw[++i];
+    if (next === undefined) break;
+    if (next >= "0" && next <= "7") {
+      let oct = next;
+      while (oct.length < 3 && raw[i + 1] >= "0" && raw[i + 1] <= "7") {
+        oct += raw[++i];
+      }
+      out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+    } else {
+      out += { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f" }[next] ?? next;
+    }
+  }
+  return out;
+}
+
+function pdfDecodeBytes(bytes) {
+  // Heuristic: UTF-16BE strings start with a BOM; everything else is treated
+  // as PDFDocEncoding, which matches latin1 for the ASCII range.
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    const body = bytes.subarray(2);
+    const swapped = Buffer.alloc(body.length - (body.length % 2));
+    for (let i = 0; i + 1 < body.length; i += 2) {
+      swapped[i] = body[i + 1];
+      swapped[i + 1] = body[i];
+    }
+    return swapped.toString("utf16le");
+  }
+  return bytes.toString("latin1");
+}
+
+/** Extracts text pieces from a PDF content stream (Tj/TJ/'/"). */
+function pdfContentText(content) {
+  const raw = content.toString("latin1");
+  const lines = [];
+  let line = "";
+  const nums = [];
+  let lastStr = "";
+
+  function flushLine() {
+    if (line.trim()) lines.push(line.trimEnd());
+    line = "";
+  }
+
+  const tokenRe =
+    /\((?:\\[\s\S]|[^\\()])*\)|<[0-9A-Fa-f\s]*>|\[[^\]]*\]|[-+.\d]+|[A-Za-z'"*]{1,3}/g;
+  let m;
+  let skippingImage = false;
+  while ((m = tokenRe.exec(raw)) !== null) {
+    const token = m[0];
+    // Skip inline images (BI ... ID ... EI): their raw bytes can mimic
+    // string tokens and would leak into the text as garbage.
+    if (skippingImage) {
+      if (token === "EI") skippingImage = false;
+      continue;
+    }
+    if (token === "BI") {
+      skippingImage = true;
+      continue;
+    }
+    if (token.startsWith("(")) {
+      lastStr = pdfUnescape(token.slice(1, -1));
+      nums.push(lastStr);
+    } else if (token.startsWith("<")) {
+      const hex = token.slice(1, -1).replace(/\s+/g, "");
+      lastStr = pdfDecodeBytes(Buffer.from(hex, "hex"));
+      nums.push(lastStr);
+    } else if (token.startsWith("[")) {
+      const inner = token.slice(1, -1);
+      let joined = "";
+      for (const p of inner.matchAll(/\((?:\\[\s\S]|[^\\()])*\)|<[0-9A-Fa-f\s]*>/g)) {
+        joined += p[0].startsWith("(")
+          ? pdfUnescape(p[0].slice(1, -1))
+          : pdfDecodeBytes(Buffer.from(p[0].slice(1, -1).replace(/\s+/g, ""), "hex"));
+      }
+      lastStr = joined;
+      nums.push(joined);
+    } else if (/^[-+.\d]/.test(token)) {
+      nums.push(parseFloat(token));
+    } else {
+      switch (token) {
+        case "Tj":
+          line += lastStr;
+          break;
+        case "'":
+        case '"':
+          flushLine();
+          line += lastStr;
+          break;
+        case "TJ":
+          line += lastStr;
+          break;
+        case "Td":
+        case "TD": {
+          const ty = nums.filter((n) => typeof n === "number").pop();
+          if (ty !== undefined && ty !== 0) flushLine();
+          break;
+        }
+        case "T*":
+          flushLine();
+          break;
+        case "ET":
+          flushLine();
+          break;
+        default:
+          break;
+      }
+      nums.length = 0;
+      lastStr = "";
+    }
+  }
+  flushLine();
+  return lines.join("\n");
+}
+
+/** Indexes every `N 0 obj ... endobj` body, keeping stream bytes aside. */
+function pdfObjects(buf) {
+  const latin = buf.toString("latin1");
+  const objects = new Map();
+  const re = /(\d+)\s+\d+\s+obj\b/g;
+  let m;
+  while ((m = re.exec(latin)) !== null) {
+    const num = Number(m[1]);
+    const start = m.index + m[0].length;
+    const end = latin.indexOf("endobj", start);
+    if (end === -1) continue;
+    const body = latin.slice(start, end);
+    const streamIdx = body.indexOf("stream");
+    let dict = body;
+    let stream = null;
+    if (streamIdx !== -1) {
+      dict = body.slice(0, streamIdx);
+      let sStart = streamIdx + 6;
+      if (body[sStart] === "\r") sStart += 1;
+      if (body[sStart] === "\n") sStart += 1;
+      const sEnd = body.indexOf("endstream", sStart);
+      if (sEnd !== -1) stream = buf.subarray(start + sStart, start + sEnd);
+    }
+    if (!objects.has(num)) objects.set(num, { dict, stream });
+  }
+  return objects;
+}
+
+function pdfRefs(dict, key) {
+  const single = new RegExp(`${key}\\s+(\\d+)\\s+\\d+\\s+R`).exec(dict);
+  if (single) return [Number(single[1])];
+  const arr = new RegExp(`${key}\\s*\\[([^\\]]*)\\]`).exec(dict);
+  if (arr) {
+    return [...arr[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((r) => Number(r[1]));
+  }
+  return null;
+}
+
+async function readPdfFile(abs, buf, page) {
+  if (buf.subarray(0, 5).toString("latin1") !== "%PDF-") {
+    throw new Error(`Not a PDF file (missing %PDF header): ${abs}`);
+  }
+  if (buf.length > 50_000_000) {
+    throw new Error(`PDF is larger than 50 MB: ${abs}. Refusing to parse.`);
+  }
+
+  const objects = pdfObjects(buf);
+  const latin = buf.toString("latin1");
+  let rootNum = null;
+  for (const m of latin.matchAll(/\/Root\s+(\d+)\s+\d+\s+R/g)) rootNum = Number(m[1]);
+  if (rootNum === null) {
+    for (const [num, obj] of objects) {
+      if (/\/Type\s*\/Catalog\b/.test(obj.dict)) rootNum = num;
+    }
+  }
+  if (rootNum === null || !objects.get(rootNum)) {
+    throw new Error("PDF structure not recognized (no document catalog).");
+  }
+
+  const pages = [];
+  const seen = new Set();
+  (function collectPages(num, depth) {
+    if (depth > 12 || seen.has(num)) return;
+    seen.add(num);
+    const obj = objects.get(num);
+    if (!obj) return;
+    if (/\/Type\s*\/Pages\b/.test(obj.dict)) {
+      for (const kid of pdfRefs(obj.dict, "/Kids") ?? []) collectPages(kid, depth + 1);
+    } else if (/\/Type\s*\/Page\b/.test(obj.dict)) {
+      pages.push(obj);
+    }
+  })(pdfRefs(objects.get(rootNum).dict, "/Pages")?.[0], 0);
+
+  if (!pages.length) throw new Error("No pages found in the PDF.");
+  if (page && page > pages.length) {
+    throw new Error(`The PDF has ${pages.length} page(s); page ${page} does not exist.`);
+  }
+
+  const chunks = [`PDF: ${abs} (${pages.length} page(s))`, "---"];
+  for (let i = 0; i < (page ? 1 : pages.length); i += 1) {
+    const realIndex = page ? page : i + 1;
+    const obj = pages[realIndex - 1];
+    chunks.push(`--- page ${realIndex} ---`);
+    try {
+      const texts = [];
+      for (const cnum of pdfRefs(obj.dict, "/Contents") ?? []) {
+        const cobj = objects.get(cnum);
+        if (!cobj?.stream) continue;
+        let data = cobj.stream;
+        if (/FlateDecode/.test(cobj.dict)) {
+          try {
+            data = zlib.inflateSync(data);
+          } catch {
+            continue;
+          }
+        }
+        texts.push(pdfContentText(data));
+      }
+      const pageText = texts.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+      chunks.push(pageText || "(no extractable text — the page is probably a scanned image)");
+    } catch (e) {
+      chunks.push(`(page could not be parsed: ${e.message})`);
+    }
+  }
+  return chunks.join("\n");
+}
+
+/* -------------------------------- notebooks ------------------------------- */
+
+/** Renders a .ipynb notebook as readable text for read_file. */
+function renderNotebook(abs, buf) {
+  let nb;
+  try {
+    nb = JSON.parse(buf.toString("utf8"));
+  } catch (e) {
+    throw new Error(`Invalid notebook JSON in ${abs}: ${e.message}`);
+  }
+  const cells = Array.isArray(nb.cells) ? nb.cells : [];
+  const parts = [`Notebook: ${abs} (${cells.length} cell(s))`, "---"];
+
+  cells.forEach((cell, index) => {
+    const type =
+      cell.cell_type === "markdown" ? "markdown" : cell.cell_type === "raw" ? "raw" : "code";
+    const source = Array.isArray(cell.source) ? cell.source.join("") : String(cell.source ?? "");
+    parts.push(`--- cell ${index} [${type}] ---`);
+    parts.push(source.trimEnd() || "(empty)");
+
+    const outputs = Array.isArray(cell.outputs) ? cell.outputs : [];
+    for (const output of outputs) {
+      const data = output?.data ?? {};
+      if (data["image/png"]) {
+        parts.push(`[output: image (${String(data["image/png"]).length} base64 chars)]`);
+        continue;
+      }
+      let textOut = output?.text ?? data["text/plain"];
+      if (Array.isArray(textOut)) textOut = textOut.join("");
+      if (typeof textOut === "string" && textOut.trim()) {
+        parts.push(`[output${output?.output_type ? `: ${output.output_type}` : ""}]`);
+        parts.push(textOut.length > 2000 ? textOut.slice(0, 2000) + "…" : textOut.trimEnd());
+      } else if (output?.ename) {
+        parts.push(`[output: error ${output.ename}: ${output.evalue ?? ""}]`);
+      }
+    }
+  });
+
+  return parts.join("\n");
+}
+
 const SHELL_MODE = (
   process.env.MCP_SHELL || (process.platform === "win32" ? "powershell" : "sh")
 ).toLowerCase();
@@ -883,15 +1309,59 @@ function killProcessTree(pid) {
   }
 }
 
+function capKeeps(limit) {
+  const head = Math.floor(limit * 0.6);
+  return { head, tail: limit - head };
+}
+
+function makeCapState(limit) {
+  return { text: "", tail: "", dropped: 0, truncated: false, limit };
+}
+
+/**
+ * Incremental cap for streamed output: keeps the head and, once the cap is
+ * hit, also the most recent tail. Head-only truncation loses the end of the
+ * output, which is where errors and summaries usually live.
+ */
 function appendCapped(state, chunk) {
-  if (state.truncated) return;
+  const { head, tail } = capKeeps(state.limit);
+  if (state.truncated) {
+    state.dropped += chunk.length;
+    state.tail = (state.tail + chunk).slice(-tail);
+    return;
+  }
   const next = state.text + chunk;
-  if (next.length > MAX_OUTPUT_CHARS) {
-    state.text = next.slice(0, MAX_OUTPUT_CHARS);
+  if (next.length > head) {
+    state.text = next.slice(0, head);
+    state.dropped = next.length - head;
+    state.tail = next.slice(-tail);
     state.truncated = true;
     return;
   }
   state.text = next;
+}
+
+function cappedText(state) {
+  if (!state.truncated) return state.text;
+  const omitted = Math.max(0, state.dropped - state.tail.length);
+  return (
+    state.text +
+    `\n… ${omitted} characters hidden (first and last parts shown) …\n` +
+    state.tail
+  );
+}
+
+/** One-shot cap for assembled strings: keeps the head and the tail. */
+function capMiddle(text, maxChars = MAX_OUTPUT_CHARS) {
+  if (text.length <= maxChars) return text;
+  const tailKeep = Math.floor(maxChars * 0.25);
+  const headKeep = maxChars - tailKeep;
+  const omitted = text.length - headKeep - tailKeep;
+  return (
+    text.slice(0, headKeep) +
+    `\n… ${omitted} characters hidden (first and last parts shown) …\n` +
+    text.slice(-tailKeep)
+  );
 }
 
 /**
@@ -936,8 +1406,12 @@ function runCommand(command, cwd, timeoutMs) {
       },
     });
 
-    const out = { text: "", truncated: false };
-    const err = { text: "", truncated: false };
+    const out = makeCapState(MAX_OUTPUT_CHARS);
+    const err = makeCapState(MAX_OUTPUT_CHARS);
+    // StringDecoder keeps multibyte characters intact when a chunk splits
+    // a UTF-8 sequence in the middle (plain toString() would emit U+FFFD).
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
     let timedOut = false;
     let settled = false;
 
@@ -950,11 +1424,18 @@ function runCommand(command, cwd, timeoutMs) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      appendCapped(out, outDecoder.end());
+      appendCapped(err, errDecoder.end());
       const durationMs = Date.now() - startedAt;
-      const stderrText =
-        shellName.startsWith("powershell") || shellName === "pwsh"
-          ? decodePowerShellStderr(err.text)
-          : err.text;
+      const isPowerShell =
+        shellName.startsWith("powershell") || shellName === "pwsh";
+      const stderrText = isPowerShell
+        ? err.truncated
+          ? decodePowerShellStderr(err.text) +
+            `\n… ${Math.max(0, err.dropped - err.tail.length)} characters hidden (first and last parts shown) …\n` +
+            decodePowerShellStderr(err.tail)
+          : decodePowerShellStderr(err.text)
+        : cappedText(err);
       resolve({
         command,
         cwd,
@@ -963,9 +1444,9 @@ function runCommand(command, cwd, timeoutMs) {
         signal: signal || null,
         timedOut,
         durationMs,
-        stdout: out.text,
+        stdout: cappedText(out),
         stdoutTruncated: out.truncated,
-        stderr: stderrText,
+        stderr: cappedText(err),
         stderrTruncated: err.truncated,
         spawnError: spawnError || null,
       });
@@ -973,8 +1454,8 @@ function runCommand(command, cwd, timeoutMs) {
 
     child.on("error", (error) => finish(null, null, error));
     child.on("close", (code, signal) => finish(code, signal));
-    child.stdout?.on("data", (chunk) => appendCapped(out, chunk.toString("utf8")));
-    child.stderr?.on("data", (chunk) => appendCapped(err, chunk.toString("utf8")));
+    child.stdout?.on("data", (chunk) => appendCapped(out, outDecoder.write(chunk)));
+    child.stderr?.on("data", (chunk) => appendCapped(err, errDecoder.write(chunk)));
   });
 }
 
@@ -1016,13 +1497,13 @@ function formatCommandResult(result) {
 
   parts.push("", "--- stdout ---", result.stdout.trimEnd() || "(empty)");
   if (result.stdoutTruncated) {
-    parts.push(`… stdout truncated to ${MAX_OUTPUT_CHARS} characters.`);
+    parts.push("… stdout truncated (first and last parts shown).");
   }
 
   if (result.stderr.trim()) {
     parts.push("", "--- stderr ---", result.stderr.trimEnd());
     if (result.stderrTruncated) {
-      parts.push(`… stderr truncated to ${MAX_OUTPUT_CHARS} characters.`);
+      parts.push("… stderr truncated (first and last parts shown).");
     }
   }
 
@@ -1030,23 +1511,41 @@ function formatCommandResult(result) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                   Server                                  */
+/*                            background processes                            */
 /* -------------------------------------------------------------------------- */
-
-/* --------------------------- background processes ------------------------- */
 
 const BACKGROUND = new Map();
 
 function appendProcessOutput(record, key, chunk) {
+  const tailKey = `${key}Tail`;
+  const droppedKey = `${key}Dropped`;
   const truncatedKey = `${key}Truncated`;
-  if (record[truncatedKey]) return;
+  const { head, tail } = capKeeps(record[`${key}Limit`] ?? MAX_PROCESS_BUFFER);
+  if (record[truncatedKey]) {
+    record[droppedKey] += chunk.length;
+    record[tailKey] = (record[tailKey] + chunk).slice(-tail);
+    return;
+  }
   const next = record[key] + chunk;
-  if (next.length > MAX_PROCESS_BUFFER) {
-    record[key] = next.slice(0, MAX_PROCESS_BUFFER);
+  if (next.length > head) {
+    record[key] = next.slice(0, head);
+    record[droppedKey] = next.length - head;
+    record[tailKey] = next.slice(-tail);
     record[truncatedKey] = true;
     return;
   }
   record[key] = next;
+}
+
+function processOutputText(record, key) {
+  if (!record[`${key}Truncated`]) return record[key];
+  const tail = record[`${key}Tail`];
+  const omitted = Math.max(0, record[`${key}Dropped`] - tail.length);
+  return (
+    record[key] +
+    `\n… ${omitted} characters hidden (first and last parts shown) …\n` +
+    tail
+  );
 }
 
 function waitForExit(record, ms) {
@@ -1075,15 +1574,15 @@ function describeProcess(record) {
 
 function formatProcessOutput(record) {
   const parts = describeProcess(record);
-  parts.push("", "--- stdout ---", record.stdout.trimEnd() || "(empty)");
+  parts.push("", "--- stdout ---", processOutputText(record, "stdout").trimEnd() || "(empty)");
   if (record.stdoutTruncated) {
-    parts.push(`… stdout truncated to ${MAX_PROCESS_BUFFER} characters.`);
+    parts.push("… stdout truncated (first and last parts shown).");
   }
-  if (record.stderr.trim()) {
-    parts.push("", "--- stderr ---", record.stderr.trimEnd());
-    if (record.stderrTruncated) {
-      parts.push(`… stderr truncated to ${MAX_PROCESS_BUFFER} characters.`);
-    }
+  const stderrText = record.stderrTruncated
+    ? decodePowerShellStderr(processOutputText(record, "stderr"))
+    : processOutputText(record, "stderr");
+  if (stderrText.trim()) {
+    parts.push("", "--- stderr ---", stderrText.trimEnd());
   }
   if (record.spawnError) parts.push("", `Failed to start: ${record.spawnError}`);
   if (!record.finished) {
@@ -1131,13 +1630,21 @@ function startBackgroundProcess(command, cwd) {
     startedAt: Date.now(),
     endedAt: null,
     stdout: "",
+    stdoutTail: "",
+    stdoutDropped: 0,
+    stdoutLimit: MAX_PROCESS_BUFFER,
     stderr: "",
+    stderrTail: "",
+    stderrDropped: 0,
+    stderrLimit: MAX_PROCESS_BUFFER,
     stdoutTruncated: false,
     stderrTruncated: false,
     exitCode: null,
     signal: null,
     finished: false,
     spawnError: null,
+    outDecoder: new StringDecoder("utf8"),
+    errDecoder: new StringDecoder("utf8"),
   };
   record.exitPromise = new Promise((resolve) => {
     record.resolveExit = resolve;
@@ -1150,6 +1657,8 @@ function startBackgroundProcess(command, cwd) {
     record.resolveExit();
   });
   child.on("close", (code, signal) => {
+    appendProcessOutput(record, "stdout", record.outDecoder.end());
+    appendProcessOutput(record, "stderr", record.errDecoder.end());
     record.exitCode = typeof code === "number" ? code : null;
     record.signal = signal || null;
     record.finished = true;
@@ -1166,10 +1675,10 @@ function startBackgroundProcess(command, cwd) {
     record.resolveExit();
   });
   child.stdout?.on("data", (chunk) =>
-    appendProcessOutput(record, "stdout", chunk.toString("utf8")),
+    appendProcessOutput(record, "stdout", record.outDecoder.write(chunk)),
   );
   child.stderr?.on("data", (chunk) =>
-    appendProcessOutput(record, "stderr", chunk.toString("utf8")),
+    appendProcessOutput(record, "stderr", record.errDecoder.write(chunk)),
   );
 
   BACKGROUND.set(record.id, record);
@@ -1189,8 +1698,47 @@ function stopAllProcesses() {
 
 const server = new McpServer({
   name: "claude-file-manager",
-  version: "1.3.0",
+  version: "1.4.0",
 });
+
+/**
+ * Asks the user through the MCP client (elicitation). Returns true when the
+ * user explicitly confirmed, false on decline/cancel, and null when the
+ * client cannot ask at all (then the caller decides how to proceed).
+ */
+async function confirmDangerous(message) {
+  try {
+    const result = await server.server.request(
+      {
+        method: "elicitation/create",
+        params: {
+          mode: "form",
+          message,
+          requestedSchema: {
+            type: "object",
+            properties: {
+              confirm: {
+                type: "boolean",
+                title: "Proceed",
+                description: "true — do it",
+              },
+            },
+            required: ["confirm"],
+          },
+        },
+      },
+      ElicitResultSchema,
+    );
+    if (result?.action === "accept") return result.content?.confirm === true;
+    return false;
+  } catch (e) {
+    console.error(
+      "[claude-file-manager] elicitation is not available:",
+      e instanceof Error ? e.message : e,
+    );
+    return null;
+  }
+}
 
 server.registerTool(
   "list_roots",
@@ -1479,9 +2027,15 @@ server.registerTool(
         .min(1)
         .optional()
         .describe("Last line (inclusive)"),
+      page: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("For PDF files: 1-based page number to read (default: all pages)"),
     },
   },
-  async ({ path: inputPath, start_line, end_line }) => {
+  async ({ path: inputPath, start_line, end_line, page }) => {
     try {
       const abs = resolvePath(inputPath);
       const stat = await statOrNull(abs);
@@ -1491,6 +2045,28 @@ server.registerTool(
       }
 
       const buf = await fs.readFile(abs);
+
+      // Structured formats that must not go through the binary check or the
+      // plain-text path.
+      if (path.extname(abs).toLowerCase() === ".pdf") {
+        noteRead(abs, stat);
+        let pdfText = await readPdfFile(abs, buf, page);
+        if (pdfText.length > MAX_READ_CHARS) {
+          pdfText =
+            capMiddle(pdfText, MAX_READ_CHARS) +
+            `\n\n… use the page parameter to read specific pages.`;
+        }
+        return text(pdfText);
+      }
+      if (path.extname(abs).toLowerCase() === ".ipynb") {
+        noteRead(abs, stat);
+        let nbText = renderNotebook(abs, buf);
+        if (nbText.length > MAX_READ_CHARS) {
+          nbText = capMiddle(nbText, MAX_READ_CHARS);
+        }
+        return text(nbText);
+      }
+
       if (isProbablyBinary(buf)) {
         return text(
           `File looks binary (${formatBytes(buf.length)}): ${abs}\n` +
@@ -1498,6 +2074,7 @@ server.registerTool(
         );
       }
 
+      noteRead(abs, stat);
       let content = buf.toString("utf8");
 
       if (start_line !== undefined || end_line !== undefined) {
@@ -1617,6 +2194,7 @@ server.registerTool(
           `File already exists: ${abs}. Set overwrite=true to overwrite it.`,
         );
       }
+      if (existing) requireReadBeforeModify(abs, existing, "overwrite");
 
       const backup = existing ? await backupFile(abs) : null;
 
@@ -1626,6 +2204,7 @@ server.registerTool(
 
       await fs.writeFile(abs, content, "utf8");
       const stat = await fs.stat(abs);
+      noteRead(abs, stat);
 
       await recordActivity(
         existing ? "write" : "create",
@@ -1672,6 +2251,7 @@ server.registerTool(
 
       const backup = stat ? await backupFile(abs) : null;
       await fs.appendFile(abs, content, "utf8");
+      noteRead(abs, await fs.stat(abs));
 
       await recordActivity(
         "append",
@@ -1716,6 +2296,7 @@ server.registerTool(
       if (!stat) throw new Error(`File not found: ${abs}`);
       if (stat.isDirectory()) throw new Error(`This is a folder: ${abs}`);
 
+      requireReadBeforeModify(abs, stat, "edit");
       const content = await fs.readFile(abs, "utf8");
 
       if (old_string === new_string) {
@@ -1744,6 +2325,7 @@ server.registerTool(
 
       const backup = await backupFile(abs);
       await fs.writeFile(abs, updated, "utf8");
+      noteRead(abs, await fs.stat(abs));
 
       await recordActivity(
         "edit",
@@ -1794,9 +2376,9 @@ server.registerTool(
       if (!stat) throw new Error(`File not found: ${abs}`);
       if (stat.isDirectory()) throw new Error(`This is a folder: ${abs}`);
 
+      requireReadBeforeModify(abs, stat, "edit");
       const original = await fs.readFile(abs, "utf8");
       let current = original;
-
       edits.forEach((edit, index) => {
         const number = index + 1;
         if (edit.old_string === edit.new_string) {
@@ -1821,6 +2403,7 @@ server.registerTool(
 
       const backup = await backupFile(abs);
       await fs.writeFile(abs, current, "utf8");
+      noteRead(abs, await fs.stat(abs));
 
       await recordActivity(
         "multi_edit",
@@ -1831,6 +2414,99 @@ server.registerTool(
       return text(
         `File updated: ${abs}\nReplacements: ${edits.length}\n\n` +
           summarizeChanges(original, current),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "edit_notebook",
+  {
+    title: "Edit a Jupyter notebook",
+    description:
+      "Edits a .ipynb notebook: replaces, inserts or deletes a cell. Cell " +
+      "indexes are 0-based; read_file shows them. A backup is saved before " +
+      "editing (undo_last_change). The file must be read first.",
+    inputSchema: {
+      path: z.string().describe("Notebook path (.ipynb)"),
+      mode: z
+        .enum(["replace", "insert", "delete"])
+        .default("replace")
+        .describe("replace the cell, insert before it, or delete it"),
+      cell: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("Cell index, 0-based"),
+      source: z
+        .string()
+        .optional()
+        .describe("New cell source (required for replace and insert)"),
+      cell_type: z
+        .enum(["code", "markdown", "raw"])
+        .optional()
+        .describe("Type for an inserted cell (default: code)"),
+    },
+  },
+  async ({ path: inputPath, mode, cell, source, cell_type }) => {
+    try {
+      const abs = resolvePath(inputPath);
+      assertNotData(abs);
+      const stat = await statOrNull(abs);
+      if (!stat) throw new Error(`File not found: ${abs}`);
+      if (stat.isDirectory()) throw new Error(`This is a folder: ${abs}`);
+      if (path.extname(abs).toLowerCase() !== ".ipynb") {
+        throw new Error(`Not a notebook (expected .ipynb): ${abs}`);
+      }
+      requireReadBeforeModify(abs, stat, "edit");
+
+      let nb;
+      try {
+        nb = JSON.parse(await fs.readFile(abs, "utf8"));
+      } catch (e) {
+        throw new Error(`Invalid notebook JSON in ${abs}: ${e.message}`);
+      }
+      if (!Array.isArray(nb.cells)) {
+        throw new Error(`${abs} has no cells array — not a valid notebook.`);
+      }
+      const cells = nb.cells;
+
+      if (mode === "replace") {
+        if (cell >= cells.length) {
+          throw new Error(`Cell ${cell} does not exist (the notebook has ${cells.length}).`);
+        }
+        if (source === undefined) throw new Error("source is required for mode=replace.");
+        cells[cell] = { ...cells[cell], source };
+      } else if (mode === "insert") {
+        if (source === undefined) throw new Error("source is required for mode=insert.");
+        const type = cell_type ?? "code";
+        const newCell = { cell_type: type, metadata: {}, source };
+        // nbformat gives outputs to code cells only.
+        if (type === "code") newCell.outputs = [];
+        cells.splice(Math.min(cell, cells.length), 0, newCell);
+      } else {
+        if (cell >= cells.length) {
+          throw new Error(`Cell ${cell} does not exist (the notebook has ${cells.length}).`);
+        }
+        cells.splice(cell, 1);
+      }
+
+      const backup = await backupFile(abs);
+      await fs.writeFile(abs, JSON.stringify(nb, null, 1) + "\n", "utf8");
+      noteRead(abs, await fs.stat(abs));
+
+      await recordActivity(
+        "edit_notebook",
+        `Edit notebook ${shortName(abs)} (${mode} cell ${cell})`,
+        { kind: "restore_file", target: abs, backup },
+      );
+
+      return text(
+        `Notebook updated: ${abs}\nCells: ${cells.length} (${mode} at index ${cell})\n` +
+          `Backup saved (undo_last_change).`,
       );
     } catch (e) {
       return fail(e);
@@ -1886,7 +2562,9 @@ server.registerTool(
       overwrite: z
         .boolean()
         .default(false)
-        .describe("Allow replacing an existing file/folder"),
+        .describe(
+          "Allow replacing an existing file/folder (the replaced item goes to the trash)",
+        ),
     },
   },
   async ({ source, destination, overwrite }) => {
@@ -1899,14 +2577,33 @@ server.registerTool(
       const fromStat = await statOrNull(from);
       if (!fromStat) throw new Error(`Source not found: ${from}`);
 
+      if (pathsEqual(from, to)) {
+        throw new Error("Source and destination are the same path.");
+      }
+      if (fromStat.isDirectory() && insideDir(to, from)) {
+        throw new Error(`Cannot move a folder into itself: ${from} → ${to}`);
+      }
+
       const toStat = await statOrNull(to);
+      let replacedNote = "";
       if (toStat && !overwrite) {
         throw new Error(
           `Destination already exists: ${to}. Set overwrite=true to replace it.`,
         );
       }
       if (toStat && overwrite) {
-        await fs.rm(to, { recursive: true, force: true });
+        // Trash the previous destination instead of deleting it, so an
+        // accidental overwrite stays reversible.
+        const replaced = await moveToTrash(
+          to,
+          toStat.isDirectory() ? "directory" : "file",
+        );
+        await recordActivity(
+          "delete",
+          `Replaced by move: ${shortName(to)}`,
+          { kind: "restore_trash", trashId: replaced.id },
+        );
+        replacedNote = `\nThe previous destination was moved to trash (id: ${replaced.id}).`;
       }
 
       await fs.mkdir(path.dirname(to), { recursive: true });
@@ -1926,7 +2623,7 @@ server.registerTool(
         { kind: "move_back", from: to, to: from },
       );
 
-      return text(`Moved:\n  from: ${from}\n  to:   ${to}`);
+      return text(`Moved:\n  from: ${from}\n  to:   ${to}` + replacedNote);
     } catch (e) {
       return fail(e);
     }
@@ -1944,7 +2641,9 @@ server.registerTool(
       overwrite: z
         .boolean()
         .default(false)
-        .describe("Allow replacing an existing destination"),
+        .describe(
+          "Allow replacing an existing destination (the replaced item goes to the trash)",
+        ),
     },
   },
   async ({ source, destination, overwrite }) => {
@@ -1956,11 +2655,31 @@ server.registerTool(
       const fromStat = await statOrNull(from);
       if (!fromStat) throw new Error(`Source not found: ${from}`);
 
+      if (pathsEqual(from, to)) {
+        throw new Error("Source and destination are the same path.");
+      }
+      if (fromStat.isDirectory() && insideDir(to, from)) {
+        throw new Error(`Cannot copy a folder into itself: ${from} → ${to}`);
+      }
+
       const toStat = await statOrNull(to);
+      let replacedNote = "";
       if (toStat && !overwrite) {
         throw new Error(
           `Destination already exists: ${to}. Set overwrite=true to replace it.`,
         );
+      }
+      if (toStat && overwrite) {
+        const replaced = await moveToTrash(
+          to,
+          toStat.isDirectory() ? "directory" : "file",
+        );
+        await recordActivity(
+          "delete",
+          `Replaced by copy: ${shortName(to)}`,
+          { kind: "restore_trash", trashId: replaced.id },
+        );
+        replacedNote = `\nThe previous destination was moved to trash (id: ${replaced.id}).`;
       }
 
       await fs.mkdir(path.dirname(to), { recursive: true });
@@ -1976,7 +2695,7 @@ server.registerTool(
         { kind: "remove", target: to },
       );
 
-      return text(`Copied:\n  from: ${from}\n  to:   ${to}`);
+      return text(`Copied:\n  from: ${from}\n  to:   ${to}` + replacedNote);
     } catch (e) {
       return fail(e);
     }
@@ -2017,7 +2736,8 @@ server.registerTool(
         );
       }
 
-      const { entries, totalBytes, skippedLinks } = await collectZipEntries(sources);
+      const { entries, totalBytes, skippedLinks, skippedSelf } =
+        await collectZipEntries(sources, { exclude: dest });
       if (!entries.length) {
         throw new Error("Nothing to zip: all sources are empty or symlinks.");
       }
@@ -2035,7 +2755,8 @@ server.registerTool(
         `Archive created: ${dest}\n` +
           `Entries: ${entries.length} (${formatBytes(totalBytes)} of files)\n` +
           `Archive size: ${formatBytes(size)}` +
-          (skippedLinks ? `\nSkipped symlinks: ${skippedLinks}` : ""),
+          (skippedLinks ? `\nSkipped symlinks: ${skippedLinks}` : "") +
+          (skippedSelf ? `\nThe archive file itself was skipped.` : ""),
       );
     } catch (e) {
       return fail(e);
@@ -2142,9 +2863,20 @@ server.registerTool(
       const type = stat.isDirectory() ? "directory" : "file";
 
       if (permanent) {
+        const verdict = await confirmDangerous(
+          `Permanently delete ${abs}? This skips the trash and cannot be undone.`,
+        );
+        if (verdict === false) {
+          return text("Cancelled: permanent deletion was not confirmed by the user.");
+        }
         await fs.rm(abs, { recursive: stat.isDirectory(), force: false });
         await recordActivity("delete_permanent", `Permanently deleted ${shortName(abs)}`, null);
-        return text(`Permanently deleted: ${abs}`);
+        return text(
+          `Permanently deleted: ${abs}` +
+            (verdict === null
+              ? "\n(The client does not support confirmations, so this was not verified with the user.)"
+              : ""),
+        );
       }
 
       const { id } = await moveToTrash(abs, type);
@@ -2244,13 +2976,17 @@ server.registerTool(
         .max(40)
         .default(20)
         .describe("Maximum depth"),
+      sort: z
+        .enum(["mtime", "path"])
+        .default("mtime")
+        .describe("Newest files first (mtime) or alphabetical (path)"),
       ignore: z
         .array(z.string())
         .default([])
         .describe("Additional names/globs to skip"),
     },
   },
-  async ({ pattern, path: inputPath, include_dirs, max_results, max_depth, ignore }) => {
+  async ({ pattern, path: inputPath, include_dirs, max_results, max_depth, sort, ignore }) => {
     try {
       const start = resolvePath(inputPath);
       const stat = await statOrNull(start);
@@ -2261,7 +2997,7 @@ server.registerTool(
       const needle = withGlob ? null : pattern.toLowerCase();
       const matchPath = pattern.includes("/") || pattern.includes("\\");
 
-      const results = [];
+      let results = [];
 
       function matches(full, name) {
         const rel = normalizeRel(path.relative(start, full));
@@ -2288,6 +3024,19 @@ server.registerTool(
       });
 
       results.sort((a, b) => a.rel.localeCompare(b.rel));
+
+      if (sort === "mtime") {
+        const times = await Promise.all(
+          results.map(async (item) => {
+            const itemStat = await fs.stat(item.full).catch(() => null);
+            return itemStat ? itemStat.mtimeMs : 0;
+          }),
+        );
+        results = results
+          .map((item, index) => ({ ...item, t: times[index] }))
+          .sort((a, b) => b.t - a.t || a.rel.localeCompare(b.rel))
+          .map(({ t, ...item }) => item);
+      }
 
       if (!results.length) {
         return text(`No matches for "${pattern}" in ${start}.`);
@@ -2349,7 +3098,23 @@ server.registerTool(
       files_only: z
         .boolean()
         .default(false)
-        .describe("Only list matching files with their match counts"),
+        .describe('Deprecated: use output="files". Only list matching files with their match counts'),
+      output: z
+        .enum(["content", "files", "count"])
+        .default("content")
+        .describe(
+          "content — matching lines with context; files — matching files with counts; count — one line per file",
+        ),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("Skip this many first matches (content) or files (files/count) for pagination"),
+      type: z
+        .string()
+        .optional()
+        .describe("File type shortcut, e.g. `js`, `ts`, `python`, `go`, `rust`, `md`"),
       ignore: z
         .array(z.string())
         .default([])
@@ -2366,6 +3131,9 @@ server.registerTool(
     max_file_size,
     context_lines,
     files_only,
+    output,
+    offset,
+    type,
     ignore,
   }) => {
     try {
@@ -2387,6 +3155,17 @@ server.registerTool(
       }
 
       const includeRegex = include ? globToRegExp(include) : null;
+      const typeExts = type
+        ? FILE_TYPES[String(type).toLowerCase()] ?? null
+        : null;
+      if (type && !typeExts) {
+        throw new Error(
+          `Unknown type "${type}". Known types: ${Object.keys(FILE_TYPES).join(", ")}.`,
+        );
+      }
+
+      const mode = files_only && output === "content" ? "files" : output;
+      const limit = offset + max_results;
 
       const files = new Map();
       let matchCount = 0;
@@ -2397,10 +3176,13 @@ server.registerTool(
         maxDepth: 30,
         extraIgnore: ignore,
         onFile: async (full, entry) => {
-          if (matchCount >= max_results) return;
+          if (matchCount >= limit) return;
           const rel = normalizeRel(path.relative(start, full));
 
           if (includeRegex && !includeRegex.test(rel) && !includeRegex.test(entry.name)) {
+            return;
+          }
+          if (typeExts && !typeExts.includes(path.extname(full).toLowerCase())) {
             return;
           }
 
@@ -2430,9 +3212,10 @@ server.registerTool(
           filesScanned += 1;
           const lines = buf.toString("utf8").split(/\r\n|\n|\r/);
           const matches = [];
+          const firstIndex = matchCount;
 
           for (let i = 0; i < lines.length; i += 1) {
-            if (matchCount >= max_results) break;
+            if (matchCount >= limit) break;
             matcher.lastIndex = 0;
             if (matcher.test(lines[i])) {
               matches.push(i);
@@ -2440,7 +3223,7 @@ server.registerTool(
             }
           }
 
-          if (matches.length) files.set(rel, { rel, lines, matches });
+          if (matches.length) files.set(rel, { rel, lines, matches, firstIndex });
         },
       });
 
@@ -2452,52 +3235,64 @@ server.registerTool(
       }
 
       const blocks = [];
-      for (const file of files.values()) {
-        if (files_only) {
-          blocks.push(`${file.rel} (${file.matches.length})`);
-          continue;
-        }
 
-        const matchSet = new Set(file.matches);
-        const ranges = [];
-        for (const index of file.matches) {
-          const from = Math.max(0, index - context_lines);
-          const to = Math.min(file.lines.length - 1, index + context_lines);
-          const last = ranges[ranges.length - 1];
-          if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
-          else ranges.push({ from, to });
+      if (mode === "files" || mode === "count") {
+        const list = [...files.values()].slice(offset, offset + max_results);
+        for (const file of list) {
+          blocks.push(
+            mode === "files"
+              ? `${file.rel} (${file.matches.length})`
+              : `${file.rel}: ${file.matches.length}`,
+          );
         }
+      } else {
+        for (const file of files.values()) {
+          const visible = [];
+          file.matches.forEach((lineNo, i) => {
+            if (file.firstIndex + i >= offset) visible.push(lineNo);
+          });
+          if (!visible.length) continue;
 
-        const out = [`${file.rel}:`];
-        ranges.forEach((range, rangeIndex) => {
-          if (rangeIndex > 0) out.push("  --");
-          for (let i = range.from; i <= range.to; i += 1) {
-            const mark = matchSet.has(i) ? ":" : "-";
-            const line = file.lines[i];
-            const shown = line.length > 300 ? line.slice(0, 300) + "…" : line;
-            out.push(`  ${String(i + 1).padStart(4, " ")}${mark} ${shown.trim()}`);
+          const matchSet = new Set(visible);
+          const ranges = [];
+          for (const index of visible) {
+            const from = Math.max(0, index - context_lines);
+            const to = Math.min(file.lines.length - 1, index + context_lines);
+            const last = ranges[ranges.length - 1];
+            if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
+            else ranges.push({ from, to });
           }
-        });
-        blocks.push(out.join("\n"));
+
+          const out = [`${file.rel}:`];
+          ranges.forEach((range, rangeIndex) => {
+            if (rangeIndex > 0) out.push("  --");
+            for (let i = range.from; i <= range.to; i += 1) {
+              const mark = matchSet.has(i) ? ":" : "-";
+              const line = file.lines[i];
+              const shown = line.length > 300 ? line.slice(0, 300) + "…" : line;
+              out.push(`  ${String(i + 1).padStart(4, " ")}${mark} ${shown.trim()}`);
+            }
+          });
+          blocks.push(out.join("\n"));
+        }
       }
 
       const suffix =
-        matchCount >= max_results
-          ? `\n… reached the limit of ${max_results} matches.`
+        matchCount >= limit
+          ? `\n… reached the limit (${max_results} shown after skipping ${offset}). ` +
+            `Increase offset to see more.`
           : "";
 
-      let output =
-        `Found ${matchCount} matches in ${filesScanned} files:\n\n` +
+      let report =
+        `Found ${matchCount} matches in ${filesScanned} files` +
+        (offset ? ` (showing items after offset ${offset})` : "") +
+        `:\n\n` +
         blocks.join("\n\n") +
         suffix;
 
-      if (output.length > MAX_OUTPUT_CHARS) {
-        output =
-          output.slice(0, MAX_OUTPUT_CHARS) +
-          `\n… output truncated to ${MAX_OUTPUT_CHARS} characters.`;
-      }
+      report = capMiddle(report);
 
-      return text(output);
+      return text(report);
     } catch (e) {
       return fail(e);
     }
@@ -2737,7 +3532,9 @@ server.registerTool(
       overwrite: z
         .boolean()
         .default(false)
-        .describe("Replace the item if the original path is occupied"),
+        .describe(
+          "Replace the item if the original path is occupied (the replaced item goes to the trash)",
+        ),
     },
   },
   async ({ id, overwrite }) => {
@@ -2748,7 +3545,12 @@ server.registerTool(
         `Restore ${shortName(item.originalPath)}`,
         { kind: "remove", target: item.originalPath },
       );
-      return text(`Restored: ${item.originalPath}`);
+      return text(
+        `Restored: ${item.originalPath}` +
+          (item.replacedTrashId
+            ? `\nThe item that occupied the path was moved to trash (id: ${item.replacedTrashId}).`
+            : ""),
+      );
     } catch (e) {
       return fail(e);
     }
@@ -3007,7 +3809,11 @@ if (ALLOW_SHELL) {
         const output = formatProcessOutput(record);
         if (clear) {
           record.stdout = "";
+          record.stdoutTail = "";
+          record.stdoutDropped = 0;
           record.stderr = "";
+          record.stderrTail = "";
+          record.stderrDropped = 0;
           record.stdoutTruncated = false;
           record.stderrTruncated = false;
         }
@@ -3085,6 +3891,167 @@ if (ALLOW_SHELL) {
     },
   );
 }
+
+/* -------------------------------- resources -------------------------------- */
+
+server.registerResource(
+  "project-tree",
+  "file-manager://tree",
+  {
+    title: "Project tree",
+    description: "Compact tree of the first allowed folder (depth 3, service folders skipped).",
+    mimeType: "text/plain",
+  },
+  async () => {
+    const lines = [];
+    async function walk(dir, prefix, depth) {
+      let entries = [];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      const visible = entries
+        .filter((entry) => !DEFAULT_IGNORES.includes(entry.name))
+        .sort((a, b) => {
+          if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+          return a.name.localeCompare(b.name, "en");
+        });
+      for (let i = 0; i < visible.length && lines.length < 800; i += 1) {
+        const entry = visible[i];
+        const full = path.join(dir, entry.name);
+        const last = i === visible.length - 1;
+        lines.push(`${prefix}${last ? "└─ " : "├─ "}${entry.name}${entry.isDirectory() ? "/" : ""}`);
+        if (entry.isDirectory() && depth + 1 < 3) {
+          await walk(full, prefix + (last ? "   " : "│  "), depth + 1);
+        }
+      }
+    }
+    await walk(ROOT, "", 0);
+    return {
+      contents: [
+        {
+          uri: "file-manager://tree",
+          mimeType: "text/plain",
+          text: `Tree: ${ROOT}\n\n${lines.join("\n")}`,
+        },
+      ],
+    };
+  },
+);
+
+server.registerResource(
+  "activity-log",
+  "file-manager://activity",
+  {
+    title: "Change history",
+    description: "The activity log: every change the server made, newest last.",
+    mimeType: "application/json",
+  },
+  async () => ({
+    contents: [
+      {
+        uri: "file-manager://activity",
+        mimeType: "application/json",
+        text: JSON.stringify(await readJson(ACTIVITY_FILE, { items: [] }), null, 2),
+      },
+    ],
+  }),
+);
+
+server.registerResource(
+  "trash-index",
+  "file-manager://trash",
+  {
+    title: "Trash index",
+    description: "Deleted items kept in the trash, restorable via restore_path.",
+    mimeType: "application/json",
+  },
+  async () => ({
+    contents: [
+      {
+        uri: "file-manager://trash",
+        mimeType: "application/json",
+        text: JSON.stringify(await readJson(TRASH_INDEX, { items: [] }), null, 2),
+      },
+    ],
+  }),
+);
+
+server.registerResource(
+  "backups",
+  "file-manager://backups",
+  {
+    title: "Backup list",
+    description: "Copies saved before edits, with sizes and timestamps.",
+    mimeType: "application/json",
+  },
+  async () => {
+    let names = [];
+    try {
+      names = await fs.readdir(BACKUP_DIR);
+    } catch {
+      /* no backups yet */
+    }
+    const items = [];
+    for (const name of names) {
+      const abs = path.join(BACKUP_DIR, name);
+      const fileStat = await statOrNull(abs);
+      if (fileStat?.isFile()) {
+        items.push({ name, size: fileStat.size, modified: fileStat.mtime.toISOString() });
+      }
+    }
+    items.sort((a, b) => b.modified.localeCompare(a.modified));
+    return {
+      contents: [
+        {
+          uri: "file-manager://backups",
+          mimeType: "application/json",
+          text: JSON.stringify({ backups: items }, null, 2),
+        },
+      ],
+    };
+  },
+);
+
+server.registerResource(
+  "server-config",
+  "file-manager://config",
+  {
+    title: "Server configuration",
+    description: "Allowed folders, limits and switches of this server instance.",
+    mimeType: "application/json",
+  },
+  async () => ({
+    contents: [
+      {
+        uri: "file-manager://config",
+        mimeType: "application/json",
+        text: JSON.stringify(
+          {
+            version: "1.4.0",
+            roots: ROOTS,
+            dataDir: DATA_DIR,
+            allowOutside: ALLOW_OUTSIDE,
+            allowShell: ALLOW_SHELL,
+            shell: SHELL_MODE,
+            requireRead: REQUIRE_READ,
+            limits: {
+              maxReadChars: MAX_READ_CHARS,
+              maxListEntries: MAX_LIST_ENTRIES,
+              maxImageBytes: MAX_IMAGE_BYTES,
+              maxOutputChars: MAX_OUTPUT_CHARS,
+              maxArchiveBytes: MAX_ARCHIVE_BYTES,
+              maxBackgroundProcesses: MAX_BG_PROCESSES,
+            },
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  }),
+);
 
 /* -------------------------------------------------------------------------- */
 /*                                   Startup                                 */

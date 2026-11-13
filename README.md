@@ -13,12 +13,13 @@ It runs locally over `stdio`, without internet access or third-party services.
 | `list_roots`       | Shows the allowed folders (one or several)               |
 | `list_directory`   | Lists folder contents (optionally recursive)             |
 | `list_tree`        | Draws a compact project tree                             |
-| `read_file`        | Reads a text file, optionally a line range               |
+| `read_file`        | Reads a text file, PDF text or a Jupyter notebook; optional range |
 | `read_image`       | Shows a PNG/JPEG/GIF/WebP image to Claude                |
 | `write_file`       | Creates or overwrites a file                             |
 | `append_file`      | Appends text to the end of a file                        |
 | `edit_file`        | Replaces an exact fragment and shows a diff              |
 | `multi_edit`       | Several replacements in one call, atomically             |
+| `edit_notebook`    | Replaces, inserts or deletes a cell in a .ipynb notebook  |
 | `replace_in_files` | Replaces text across many files, with one undo step      |
 | `create_directory` | Creates a folder with all missing parents                |
 | `move_path`        | Moves or renames a file/folder                           |
@@ -27,8 +28,8 @@ It runs locally over `stdio`, without internet access or third-party services.
 | `unzip_path`       | Extracts a ZIP archive into a folder                     |
 | `delete_path`      | Moves to trash (or permanently with `permanent=true`)    |
 | `file_info`        | Shows type, size and dates of a file/folder              |
-| `find_files`       | Finds files by glob or name substring                    |
-| `search_content`   | Searches text/regex, with context lines or a file list   |
+| `find_files`       | Finds files by glob or name substring, newest first      |
+| `search_content`   | Searches text/regex; content, file list or count mode    |
 | `list_trash`       | Shows the trash                                          |
 | `restore_path`     | Restores a file/folder from the trash                    |
 | `undo_last_change` | Undoes the last change (up to 20 steps)                  |
@@ -38,13 +39,13 @@ It runs locally over `stdio`, without internet access or third-party services.
 | `stop_process`     | Stops a background process and its children             |
 | `list_processes`   | Lists background processes of this session              |
 
-That is 27 tools with the terminal enabled and 22 without. The five terminal
+That is 28 tools with the terminal enabled and 23 without. The five terminal
 tools are disabled unless `MCP_ALLOW_SHELL=1` is set. All other tools work with
 files only.
 
 ## Windows installation (prebuilt installer)
 
-Download **[ClaudeFileManager-Setup-1.3.0.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
+Download **[ClaudeFileManager-Setup-1.3.1.exe](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)**.
 
 1. Run the installer. If Windows shows the blue SmartScreen window, click
    **More info → Run anyway** (the file has no digital signature).
@@ -59,7 +60,7 @@ Download **[ClaudeFileManager-Setup-1.3.0.exe](https://github.com/sadd11/claude-
 "Claude File Manager" shortcuts appear in the Start menu and (optionally) on
 the desktop. Uninstall via **Settings → Apps**.
 
-**Portable version:** **[ClaudeFileManager-Portable-1.3.0.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
+**Portable version:** **[ClaudeFileManager-Portable-1.3.1.zip](https://github.com/sadd11/claude-file-manager-mcp/releases/latest)** —
 extract anywhere and run `start-ui.cmd`. No installation required.
 
 ### Building the installer
@@ -297,15 +298,25 @@ the switch off unless you need it, and read a command before you approve it.
 | `MCP_MAX_PROCESS_BUFFER` | `100000`           | Buffered output characters per background process    |
 | `MCP_MAX_ARCHIVE_BYTES`  | `500000000`        | Size limit for ZIP sources and extraction            |
 | `MCP_DATA_DIR`           | `<root>/.mcp`      | Where to store trash, backups and history            |
+| `MCP_REQUIRE_READ`       | `1`                | `0` — allow editing files that were not read first   |
 | `UI_PORT`                | `4317`             | Local UI port (`npm run ui`)                         |
 | `UI_NO_OPEN`             | —                  | `1` — do not open the browser automatically          |
 
 ## Security
 
-- All paths are normalized; escaping every allowed folder is blocked.
+- All paths are normalized; escaping every allowed folder is blocked,
+  including through symbolic links that point outside.
 - Root folders cannot be deleted, moved or overwritten.
 - A non-empty folder can only be deleted with `recursive=true`.
-- Overwriting or copying onto an existing file requires `overwrite=true`.
+- Overwriting or copying onto an existing file requires `overwrite=true`;
+  the replaced item goes to the trash, so the step is reversible
+  (extracting a ZIP with `overwrite=true` is the one exception).
+- A folder cannot be moved or copied into itself or its own subfolder.
+- A file must be read before it is edited or overwritten, and it must not
+  change between the read and the edit — stale edits are refused
+  (turn this off with `MCP_REQUIRE_READ=0`).
+- Permanent deletion asks for explicit confirmation through the MCP client
+  (elicitation) when the client supports it.
 - The service folder `.mcp` is protected from changes through the tools.
 - Deletion is reversible by default: the file goes to the trash.
 - Archives are extracted inside the destination only; paths that try to
