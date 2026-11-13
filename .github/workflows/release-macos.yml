@@ -33,3 +33,42 @@ jobs:
         run: |
           gh release upload "${{ github.ref_name }}" installer/out/*.dmg \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Installs the built DMG the way a user would (mount, copy to
+  # /Applications) and launches the app to prove it works end to end.
+  test-dmg:
+    runs-on: macos-latest
+    needs: dmg
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: dmg
+      - name: Mount the DMG and install to /Applications
+        run: |
+          set -e
+          DMG=$(ls dmg/*.dmg)
+          echo "Testing $DMG"
+          hdiutil attach "$DMG" -mountpoint /Volumes/cfm-test -nobrowse
+          cp -R "/Volumes/cfm-test/Claude File Manager.app" "/Applications/"
+          hdiutil detach /Volumes/cfm-test
+          ls "/Applications/Claude File Manager.app/Contents/MacOS/"
+      - name: Launch the app and check the local UI
+        run: |
+          set -e
+          UI_NO_OPEN=1 UI_PORT=4317 \
+            "/Applications/Claude File Manager.app/Contents/MacOS/claude-file-manager" &
+          APP_PID=$!
+          code=000
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4317/ || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          echo "index page: $code"
+          [ "$code" = "200" ] || { kill $APP_PID 2>/dev/null || true; exit 1; }
+          unauth=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4317/api/state)
+          echo "api without token: $unauth (expect 401)"
+          [ "$unauth" = "401" ] || { kill $APP_PID 2>/dev/null || true; exit 1; }
+          kill $APP_PID 2>/dev/null || true
+          echo "DMG app launches and serves the setup UI"
