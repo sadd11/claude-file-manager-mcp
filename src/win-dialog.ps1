@@ -24,6 +24,17 @@ if ($auto -eq "yes" -or $auto -eq "no") {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Claude Desktop spawns MCP servers with a hidden main window; without this
+# the form would inherit the hidden state and never appear on screen.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class DialogWin32 {
+  [DllImport("user32.dll")]
+  public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Claude File Manager"
 $form.ClientSize = New-Object System.Drawing.Size(584, 348)
@@ -89,6 +100,13 @@ $noButton.Add_Click({ $form.Tag = "no"; $form.Close() })
 $form.Controls.Add($noButton)
 $form.AcceptButton = $yesButton
 $form.CancelButton = $noButton
+
+# Claude Desktop spawns MCP servers with a hidden main window; the form
+# would inherit that hidden state and never appear. Re-show it from the
+# Load event, after the handle exists.
+$form.Add_Load({
+  [void][DialogWin32]::ShowWindow($form.Handle, 9) # SW_RESTORE
+})
 
 # Never leave a dialog hanging forever: if nobody answers in 5 minutes,
 # treat it as "No".
