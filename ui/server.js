@@ -9,7 +9,7 @@
 
 import http from "node:http";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream, existsSync } from "node:fs";
+import { constants as fsConstants, createReadStream, existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -160,31 +160,66 @@ async function saveState() {
 /*                                 Claude Desktop                             */
 /* -------------------------------------------------------------------------- */
 
-function desktopConfigPath() {
+function desktopConfigCandidates() {
   if (process.env.MCP_UI_DESKTOP_CONFIG) {
-    return path.resolve(process.env.MCP_UI_DESKTOP_CONFIG);
+    return [path.resolve(process.env.MCP_UI_DESKTOP_CONFIG)];
   }
-  if (process.platform === "win32") {
-    return path.join(
+  const candidates = [];
+  // Newer Claude builds keep per-account data (config included) in
+  // %LOCALAPPDATA%\Claude-Data\<instance>\. Older builds use %APPDATA%\Claude.
+  const dataDir = process.env.LOCALAPPDATA
+    ? path.join(process.env.LOCALAPPDATA, "Claude-Data")
+    : null;
+  if (dataDir && existsSync(dataDir)) {
+    try {
+      for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          candidates.push(path.join(dataDir, entry.name, "claude_desktop_config.json"));
+        }
+      }
+    } catch {
+      /* unreadable dir: fall through to the legacy path */
+    }
+  }
+  candidates.push(
+    path.join(
       process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
       "Claude",
       "claude_desktop_config.json",
-    );
-  }
-  if (process.platform === "darwin") {
-    return path.join(
-      os.homedir(),
-      "Library",
-      "Application Support",
-      "Claude",
-      "claude_desktop_config.json",
-    );
-  }
-  return path.join(
-    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
-    "Claude",
-    "claude_desktop_config.json",
+    ),
   );
+  if (process.platform === "darwin") {
+    candidates.push(
+      path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json"),
+    );
+  }
+  if (process.platform === "linux") {
+    candidates.push(
+      path.join(
+        process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
+        "Claude",
+        "claude_desktop_config.json",
+      ),
+    );
+  }
+  return candidates;
+}
+
+/** The config of a modern Claude build when one exists; legacy otherwise. */
+async function resolveDesktopConfigFile() {
+  const candidates = desktopConfigCandidates();
+  const legacy = candidates[candidates.length - 1];
+  const modern = candidates.slice(0, -1);
+  for (const candidate of modern) {
+    if (statSync(candidate, { throwIfNoEntry: false })?.isFile()) return candidate;
+  }
+  for (const candidate of modern) {
+    // No modern config yet: create it next to the instance data that exists.
+    if (statSync(path.dirname(candidate), { throwIfNoEntry: false })?.isDirectory()) {
+      return candidate;
+    }
+  }
+  return legacy;
 }
 
 function buildServerEntry(existing = null) {
@@ -221,12 +256,16 @@ function buildCodeCommand() {
 }
 
 async function connectDesktop() {
-  const file = desktopConfigPath();
+  const file = await resolveDesktopConfigFile();
 
-  // The button replaces the whole config with the canonical JSON (the same
-  // object the preview shows). A backup of the previous content is always
-  // saved next to it; hand-added env keys of the files entry itself survive.
+  // Replace the mcpServers section with the canonical JSON (the same object
+  // the preview shows). A backup of the previous content is always saved
+  // next to it; hand-added env keys of the files entry itself survive.
+  // Newer Claude builds keep app-owned top-level sections (preferences,
+  // coworkUserFilesPath) in the same file — those are preserved.
+  const APP_OWNED_KEYS = ["preferences", "coworkUserFilesPath"];
   let existingEntry = null;
+  let appOwned = null;
   let existed = false;
   let backup = null;
   try {
@@ -239,6 +278,10 @@ async function connectDesktop() {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           existingEntry = parsed.mcpServers?.files ?? null;
+          for (const key of APP_OWNED_KEYS) {
+            if (parsed[key] !== undefined) appOwned = appOwned || {};
+            if (parsed[key] !== undefined) appOwned[key] = parsed[key];
+          }
         }
       } catch {
         // Broken JSON is not a reason to block: the backup keeps the old
@@ -250,7 +293,9 @@ async function connectDesktop() {
   }
 
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(buildConfigObject(existingEntry), null, 2) + "\n", "utf8");
+  const next = buildConfigObject(existingEntry);
+  if (appOwned) Object.assign(next, appOwned);
+  await fs.writeFile(file, JSON.stringify(next, null, 2) + "\n", "utf8");
 
   return {
     message: existed
@@ -266,7 +311,7 @@ async function connectDesktop() {
 /* -------------------------------------------------------------------------- */
 
 async function configStatus() {
-  const file = desktopConfigPath();
+  const file = await resolveDesktopConfigFile();
   try {
     const config = JSON.parse(await fs.readFile(file, "utf8"));
     const entry = config?.mcpServers?.files;
@@ -993,7 +1038,7 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/state" && req.method === "GET") {
-    const desktop = desktopConfigPath();
+    const desktop = await resolveDesktopConfigFile();
     let desktopExists = false;
     try {
       await fs.access(desktop);
@@ -1167,7 +1212,7 @@ async function handleApi(req, res, url) {
       json: JSON.stringify(buildConfigObject(), null, 2),
       command: buildCodeCommand(),
       serverEntry: SERVER_ENTRY,
-      desktopConfig: desktopConfigPath(),
+      desktopConfig: await resolveDesktopConfigFile(),
     });
   }
 
