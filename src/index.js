@@ -3851,7 +3851,15 @@ if (ALLOW_SHELL) {
           };
         }
 
-        return text(formatCommandResult(result));
+        let output = formatCommandResult(result);
+        if (sandbox === false && !sandboxActive) {
+          output +=
+            "\n\nNote: sandbox=false was ignored — the sandbox is not enabled on " +
+            "this server (set MCP_SANDBOX=1 in the environment). The command ran " +
+            "with full user rights.";
+        }
+
+        return text(output);
       } catch (e) {
         return fail(e);
       }

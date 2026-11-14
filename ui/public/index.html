@@ -127,6 +127,14 @@
           </span>
         </label>
 
+        <label class="checkbox">
+          <input type="checkbox" id="allowSandbox" />
+          <span>
+            Isolate terminal commands in a sandbox (MCP_SANDBOX)
+            <small>No network; writes only inside the working folder (Windows: AppContainer, macOS: Seatbelt). The AI can ask to run a command outside it — you will see a dialog with the command.</small>
+          </span>
+        </label>
+
         <div class="actions">
           <button id="connectDesktop" class="primary" type="button">
             Connect to Claude Desktop

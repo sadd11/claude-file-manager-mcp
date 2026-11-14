@@ -54,6 +54,7 @@ let state = {
   extraRoots: [],
   allowOutside: false,
   allowShell: false,
+  sandbox: false,
   recent: [],
 };
 
@@ -138,6 +139,7 @@ async function loadState() {
     }
     state.allowOutside = Boolean(parsed.allowOutside);
     state.allowShell = Boolean(parsed.allowShell);
+    state.sandbox = Boolean(parsed.sandbox);
     if (Array.isArray(parsed.recent)) {
       state.recent = parsed.recent
         .filter((item) => typeof item === "string" && item.trim())
@@ -185,10 +187,16 @@ function desktopConfigPath() {
   );
 }
 
-function buildServerEntry() {
-  const env = applyRoots({});
+function buildServerEntry(existing = null) {
+  // Preserve env keys the UI does not manage (e.g. MCP_SANDBOX, MCP_MAX_*):
+  // a reconnect must not silently wipe hand-added settings.
+  const env = applyRoots({ ...(existing?.env ?? {}) });
   if (state.allowOutside) env.MCP_ALLOW_OUTSIDE_ROOT = "1";
+  else delete env.MCP_ALLOW_OUTSIDE_ROOT;
   if (state.allowShell) env.MCP_ALLOW_SHELL = "1";
+  else delete env.MCP_ALLOW_SHELL;
+  if (state.sandbox) env.MCP_SANDBOX = "1";
+  else delete env.MCP_SANDBOX;
   return { command: NODE_BIN, args: [SERVER_ENTRY], env };
 }
 
@@ -207,6 +215,7 @@ function buildCodeCommand() {
   }
   if (state.allowOutside) parts.push("--env MCP_ALLOW_OUTSIDE_ROOT=1");
   if (state.allowShell) parts.push("--env MCP_ALLOW_SHELL=1");
+  if (state.sandbox) parts.push("--env MCP_SANDBOX=1");
   parts.push("--", q(NODE_BIN), q(SERVER_ENTRY));
   return parts.join(" ");
 }
@@ -246,7 +255,7 @@ async function connectDesktop() {
     await fs.copyFile(file, backup);
   }
 
-  config.mcpServers.files = buildServerEntry();
+  config.mcpServers.files = buildServerEntry(config.mcpServers.files);
 
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, JSON.stringify(config, null, 2) + "\n", "utf8");
@@ -1007,6 +1016,7 @@ async function handleApi(req, res, url) {
       roots: allRoots(),
       allowOutside: state.allowOutside,
       allowShell: state.allowShell,
+      sandbox: state.sandbox,
       recent: state.recent,
       serverEntry: SERVER_ENTRY,
       desktopConfig: desktop,
@@ -1089,6 +1099,9 @@ async function handleApi(req, res, url) {
     if (body.allowShell !== undefined) {
       state.allowShell = Boolean(body.allowShell);
     }
+    if (body.sandbox !== undefined) {
+      state.sandbox = Boolean(body.sandbox);
+    }
     await saveState();
     return sendJson(res, 200, {
       root: state.root,
@@ -1096,6 +1109,7 @@ async function handleApi(req, res, url) {
       roots: allRoots(),
       allowOutside: state.allowOutside,
       allowShell: state.allowShell,
+      sandbox: state.sandbox,
       recent: state.recent,
     });
   }
