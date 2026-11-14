@@ -174,9 +174,11 @@ The UI also provides:
 - an "Allow terminal commands" switch (see below);
 - the JSON config and a ready-made Claude Code command.
 
-The UI creates (or carefully updates) `%APPDATA%\Claude\claude_desktop_config.json`,
-saves a backup, and shows the JSON config and Claude Code command if you prefer
-to connect manually.
+The button **Connect to Claude Desktop** replaces the whole content of
+`%APPDATA%\Claude\claude_desktop_config.json` with the canonical JSON shown
+in the preview — hand-added env keys of the `files` server are kept, other
+servers are removed. A backup of the previous file is always saved next to it
+(`claude_desktop_config.json.bak-…`).
 
 Keep the console window open while you use the UI. Stop it with `Ctrl+C`.
 

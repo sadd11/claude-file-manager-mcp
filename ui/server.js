@@ -200,8 +200,8 @@ function buildServerEntry(existing = null) {
   return { command: NODE_BIN, args: [SERVER_ENTRY], env };
 }
 
-function buildConfigObject() {
-  return { mcpServers: { files: buildServerEntry() } };
+function buildConfigObject(existingEntry = null) {
+  return { mcpServers: { files: buildServerEntry(existingEntry) } };
 }
 
 function buildCodeCommand() {
@@ -223,46 +223,38 @@ function buildCodeCommand() {
 async function connectDesktop() {
   const file = desktopConfigPath();
 
-  let config = {};
+  // The button replaces the whole config with the canonical JSON (the same
+  // object the preview shows). A backup of the previous content is always
+  // saved next to it; hand-added env keys of the files entry itself survive.
+  let existingEntry = null;
   let existed = false;
+  let backup = null;
   try {
     const raw = await fs.readFile(file, "utf8");
     existed = true;
+    backup = `${file}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    await fs.copyFile(file, backup);
     if (raw.trim()) {
       try {
-        config = JSON.parse(raw);
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          existingEntry = parsed.mcpServers?.files ?? null;
+        }
       } catch {
-        throw new Error(
-          `Could not parse ${file}: the file contains invalid JSON. ` +
-            `Fix it manually or delete it, then try again.`,
-        );
+        // Broken JSON is not a reason to block: the backup keeps the old
+        // content and we write a clean file over it.
       }
     }
   } catch (e) {
     if (e.code !== "ENOENT") throw e;
   }
 
-  if (typeof config !== "object" || config === null || Array.isArray(config)) {
-    throw new Error(`Expected an object in ${file}.`);
-  }
-  if (!config.mcpServers || typeof config.mcpServers !== "object") {
-    config.mcpServers = {};
-  }
-
-  let backup = null;
-  if (existed) {
-    backup = `${file}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    await fs.copyFile(file, backup);
-  }
-
-  config.mcpServers.files = buildServerEntry(config.mcpServers.files);
-
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(config, null, 2) + "\n", "utf8");
+  await fs.writeFile(file, JSON.stringify(buildConfigObject(existingEntry), null, 2) + "\n", "utf8");
 
   return {
     message: existed
-      ? "Settings updated. Fully close and reopen Claude Desktop."
+      ? "Config replaced with the canonical JSON. Fully close and reopen Claude Desktop."
       : "Configuration file created. Start Claude Desktop.",
     configPath: file,
     backup,
