@@ -19,6 +19,9 @@ const CMD_BIG = IS_WIN
 const CMD_BG = IS_WIN
   ? "Write-Output 'фон запущен'; Start-Sleep -Seconds 60"
   : "printf 'фон запущен\\n'; sleep 60";
+const CMD_AC = IS_WIN ? "Write-Output ('ac: ' + (2+2))" : "echo ac: 4";
+const CMD_OUTSIDE_9 = IS_WIN ? "Write-Output ('outside: ' + (3*3))" : "echo outside: 9";
+const CMD_OUTSIDE_16 = IS_WIN ? "Write-Output ('outside: ' + (4*4))" : "echo outside: 16";
 
 const results = [];
 function check(name, cond, extra = "") {
@@ -344,8 +347,8 @@ try {
       });
     });
 
-    const real = await sandboxCall({}, "Write-Output ('ac: ' + (2+2))");
-    if (real.timeout || (real.isError && /not executed/i.test(real.text))) {
+    const real = await sandboxCall({}, CMD_AC);
+    if (real.timeout || /not executed/i.test(real.text)) {
       console.log("SKIP  sandbox run (sandbox unavailable on this machine)");
     } else {
       check("sandbox run", !real.isError && real.text.includes("ac: 4"), real.text);
@@ -355,7 +358,7 @@ try {
     const noAnswer = await sandboxCall({ CFM_SANDBOX_TEST_FAIL: "1", CFM_DIALOG_AUTO: "no" }, "Write-Output hi");
     check("sandbox fail + No -> not executed", !noAnswer.timeout && noAnswer.text.includes("Command not executed"), noAnswer.text);
 
-    const yesAnswer = await sandboxCall({ CFM_SANDBOX_TEST_FAIL: "1", CFM_DIALOG_AUTO: "yes" }, "Write-Output ('outside: ' + (3*3))");
+    const yesAnswer = await sandboxCall({ CFM_SANDBOX_TEST_FAIL: "1", CFM_DIALOG_AUTO: "yes" }, CMD_OUTSIDE_9);
     check("sandbox fail + Yes -> runs outside", !yesAnswer.timeout && yesAnswer.text.includes("outside: 9") && yesAnswer.text.includes("sandbox: outside"), yesAnswer.text);
 
     // The AI asks to run outside the sandbox: user declines.
@@ -363,7 +366,7 @@ try {
     check("ai request + No -> not executed", !aiNo.timeout && aiNo.text.includes("Command not executed") && aiNo.text.includes("did not allow"), aiNo.text);
 
     // The AI asks to run outside the sandbox: user approves.
-    const aiYes = await sandboxCall({ CFM_DIALOG_AUTO: "yes" }, "Write-Output ('outside: ' + (4*4))", false);
+    const aiYes = await sandboxCall({ CFM_DIALOG_AUTO: "yes" }, CMD_OUTSIDE_16, false);
     check("ai request + Yes -> runs outside", !aiYes.timeout && aiYes.text.includes("outside: 16") && aiYes.text.includes("sandbox: outside (user approved)"), aiYes.text);
   }
 } catch (e) {

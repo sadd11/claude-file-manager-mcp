@@ -11,6 +11,11 @@ export const SEATBELT_BIN = "/usr/bin/sandbox-exec";
 export const SEATBELT_PROFILE = `(version 1)
 (deny network*)
 (deny file-write*)
+(allow file-read*)
+(allow process-exec*)
+(allow process-info*)
+(allow sysctl-read)
+(allow mach-lookup)
 (allow file-write*
   (subpath (param "CWD"))
   (subpath (param "DATA"))
