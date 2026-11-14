@@ -360,6 +360,7 @@ the switch off unless you need it, and read a command before you approve it.
 | `MCP_MAX_ARCHIVE_BYTES`  | `500000000`        | Size limit for ZIP sources and extraction            |
 | `MCP_DATA_DIR`           | `<root>/.mcp`      | Where to store trash, backups and history            |
 | `MCP_REQUIRE_READ`       | `1`                | `0` — allow editing files that were not read first   |
+| `MCP_SANDBOX`            | `0`                | `1` — isolate terminal commands (Windows: AppContainer, macOS: Seatbelt) |
 | `UI_PORT`                | `4317`             | Local UI port (`npm run ui`)                         |
 | `UI_NO_OPEN`             | —                  | `1` — do not open the browser automatically          |
 
@@ -386,6 +387,20 @@ the switch off unless you need it, and read a command before you approve it.
   When enabled, commands run with your user rights, are limited to the allowed
   folders, are logged to `.mcp/commands.log`, and are not covered by trash or
   undo. Background processes are capped and stopped when the server exits.
+- **Sandbox (experimental):** with `MCP_SANDBOX=1` every `run_command` is
+  isolated — **Windows:** an AppContainer (no network, writes only in the
+  working folder, mapped to a temporary drive letter); **macOS:** a Seatbelt
+  profile via `sandbox-exec` (no network, writes only in the working folder,
+  the service folder and temp directories). Commands that need the internet
+  or the user profile fail with access errors — that is the sandbox working.
+  If the sandbox itself cannot start, a custom dialog asks whether to run
+  the command outside it; the choice is logged. Background processes
+  (`start_process`) are not sandboxed.
+- The AI can also proactively request an unsandboxed run: it passes
+  `sandbox=false` to `run_command`, and a native dialog (WinForms on
+  Windows, NSAlert on macOS) shows the exact command in a black frame for
+  you to allow or decline. Declined commands are never executed; both the
+  request and the choice are logged.
 - The UI listens on `127.0.0.1` only and requires a random token in the URL,
   so other devices and websites cannot control it.
 

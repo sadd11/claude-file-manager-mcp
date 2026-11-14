@@ -25,12 +25,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import fs from "node:fs/promises";
-import { constants as fsConstants, realpathSync } from "node:fs";
+import { constants as fsConstants, realpathSync, existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { SANDBOX_ENABLED, runInAppContainer } from "./win-sandbox.js";
+import { ensureSeatbeltProfile, seatbeltWrap, isSandboxInfraError, SEATBELT_BIN } from "./mac-sandbox.js";
+import { showDialog } from "./dialog.js";
 
 /**
  * Allowed folders. MCP_FILE_ROOTS is a list separated by the platform path
@@ -1386,12 +1390,14 @@ function decodePowerShellStderr(raw) {
     .trim();
 }
 
-function runCommand(command, cwd, timeoutMs) {
+function runCommand(command, cwd, timeoutMs, wrap = null) {
   return new Promise((resolve, reject) => {
     const { file, args, shellName } = shellInvocation(command);
+    const program = wrap ? wrap.program : file;
+    const argv = wrap ? [...wrap.args, ...args] : args;
     const startedAt = Date.now();
 
-    const child = spawn(file, args, {
+    const child = spawn(program, argv, {
       cwd,
       windowsHide: true,
       detached: process.platform !== "win32",
@@ -1439,7 +1445,7 @@ function runCommand(command, cwd, timeoutMs) {
       resolve({
         command,
         cwd,
-        shell: shellName,
+        shell: wrap ? wrap.shellName : shellName,
         code: typeof code === "number" ? code : null,
         signal: signal || null,
         timedOut,
@@ -1477,6 +1483,7 @@ async function logCommand(result) {
     exitCode: result.code,
     timedOut: result.timedOut,
     durationMs: result.durationMs,
+    sandbox: result.sandbox || null,
   });
 }
 
@@ -1494,6 +1501,10 @@ function formatCommandResult(result) {
     `shell: ${result.shell} · folder: ${result.cwd}`,
     status,
   ];
+
+  if (result.sandbox) {
+    parts.push(`sandbox: ${result.sandbox}`);
+  }
 
   parts.push("", "--- stdout ---", result.stdout.trimEnd() || "(empty)");
   if (result.stdoutTruncated) {
@@ -3678,6 +3689,13 @@ if (ALLOW_SHELL) {
           ? "(Windows PowerShell 5.1; use PowerShell syntax, e.g. `Get-ChildItem` or `dir`). "
           : "(commands are joined with shell operators as usual). ") +
         "The working folder must be inside the allowed root. " +
+        (SANDBOX_ENABLED && (process.platform === "win32" || process.platform === "darwin")
+          ? "Sandbox: no network, writes only inside the working folder " +
+            `(Windows: AppContainer, macOS: Seatbelt). ` +
+            "Some commands that need the user profile or the internet degrade. " +
+            "If a command must run with full access, pass sandbox=false: the user " +
+            "will see the command in a confirmation dialog and decide. "
+          : "") +
         "Commands run with the rights of the current user and are not sandboxed, " +
         "so destructive commands really delete things. " +
         "Prefer file tools (read_file, edit_file, write_file) for editing files: " +
@@ -3701,9 +3719,17 @@ if (ALLOW_SHELL) {
           .describe(
             `Kill the command after this many milliseconds (max ${SHELL_TIMEOUT_MAX})`,
           ),
+        sandbox: z
+          .boolean()
+          .optional()
+          .describe(
+            "false — ask the user's permission to run this command outside the " +
+              "sandbox (Windows, when MCP_SANDBOX=1). A confirmation dialog shows " +
+              "the command; without consent the command is not executed.",
+          ),
       },
     },
-    async ({ command, cwd, timeout_ms }) => {
+    async ({ command, cwd, timeout_ms, sandbox }) => {
       try {
         if (!command.trim()) throw new Error("The command is empty.");
         if (command.includes("\u0000")) throw new Error("The command contains a NUL byte.");
@@ -3713,7 +3739,104 @@ if (ALLOW_SHELL) {
         if (!stat) throw new Error(`Folder not found: ${absCwd}`);
         if (!stat.isDirectory()) throw new Error(`Not a folder: ${absCwd}`);
 
-        const result = await runCommand(command, absCwd, timeout_ms);
+        const sandboxActive =
+          SANDBOX_ENABLED &&
+          (process.platform === "win32" || process.platform === "darwin");
+        let result;
+        if (sandboxActive && sandbox === false) {
+          // The AI explicitly asks to run outside the sandbox: the user sees
+          // the command in the dialog and decides.
+          const answer = await showDialog({
+            command,
+            message: "The AI asks to run this command outside the sandbox. Allow it?",
+            detail: "If allowed, the command runs with full user rights: it can " +
+              "reach the network and every folder your user can. The choice is logged.",
+          });
+          if (answer !== "yes") {
+            await logEvent({
+              cwd: absCwd, command, sandbox: "outside",
+              askedBy: "ai", declined: true,
+            });
+            return text(
+              "Command not executed: the user did not allow running it outside the sandbox.\n" +
+                "Try to achieve the goal with the sandboxed command, the file tools, " +
+                "or ask the user to run it manually.",
+            );
+          }
+          result = await runCommand(command, absCwd, timeout_ms);
+          result.sandbox = "outside (user approved)";
+        } else if (sandboxActive && process.platform === "win32") {
+          try {
+            result = await runInAppContainer({ command, cwd: absCwd, timeoutMs: timeout_ms });
+            result.stderr = decodePowerShellStderr(result.stderr);
+          } catch (sandboxError) {
+            const answer = await showDialog({
+              command,
+              message: "Failed to execute command in sandbox, do you want to execute it outside the sandbox?",
+              detail: sandboxError.message,
+            });
+            if (answer !== "yes") {
+              await logEvent({
+                cwd: absCwd, command, sandbox: "appcontainer",
+                sandboxFailed: true, declined: true,
+              });
+              return text(
+                "Command not executed.\n" +
+                  `The sandbox could not start (${sandboxError.message}), ` +
+                  "and the user chose not to run the command outside the sandbox.",
+              );
+            }
+            result = await runCommand(command, absCwd, timeout_ms);
+            result.sandbox = "outside (sandbox failed)";
+          }
+          result.stdout = capMiddle(result.stdout);
+          result.stderr = capMiddle(result.stderr);
+        } else if (sandboxActive) {
+          // macOS: Seatbelt profile via sandbox-exec.
+          try {
+            if (process.env.CFM_SANDBOX_TEST_FAIL) {
+              throw new Error("test: intentional sandbox failure (CFM_SANDBOX_TEST_FAIL)");
+            }
+            if (!existsSync(SEATBELT_BIN)) {
+              throw new Error("sandbox-exec not found at /usr/bin/sandbox-exec");
+            }
+            const profilePath = await ensureSeatbeltProfile(DATA_DIR);
+            const wrap = seatbeltWrap({
+              profilePath,
+              cwd: absCwd,
+              dataDir: DATA_DIR,
+              tmpDir: os.tmpdir(),
+            });
+            result = await runCommand(command, absCwd, timeout_ms, wrap);
+            result.sandbox = "seatbelt";
+            if (!result.spawnError && result.code !== 0 && isSandboxInfraError(result.stderr)) {
+              throw new Error((result.stderr || "").trim().split("\n")[0]);
+            }
+          } catch (sandboxError) {
+            const answer = await showDialog({
+              command,
+              message: "Failed to execute command in sandbox, do you want to execute it outside the sandbox?",
+              detail: sandboxError.message,
+            });
+            if (answer !== "yes") {
+              await logEvent({
+                cwd: absCwd, command, sandbox: "seatbelt",
+                sandboxFailed: true, declined: true,
+              });
+              return text(
+                "Command not executed.\n" +
+                  `The sandbox could not start (${sandboxError.message}), ` +
+                  "and the user chose not to run the command outside the sandbox.",
+              );
+            }
+            result = await runCommand(command, absCwd, timeout_ms);
+            result.sandbox = "outside (sandbox failed)";
+          }
+          result.stdout = capMiddle(result.stdout);
+          result.stderr = capMiddle(result.stderr);
+        } else {
+          result = await runCommand(command, absCwd, timeout_ms);
+        }
         await logCommand(result);
 
         if (result.spawnError) {

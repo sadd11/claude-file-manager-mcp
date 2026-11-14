@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const IS_WIN = process.platform === "win32";
+const IS_DARWIN = process.platform === "darwin";
 
 const CMD_HELLO = IS_WIN ? "Write-Output 'привет мир'" : "printf 'привет мир\\n'";
 const CMD_BIG = IS_WIN
@@ -296,6 +297,75 @@ try {
   const out = await ok("read_output", { id: bgId, wait_ms: 3000 });
   check("bg cyrillic output", out.includes("фон запущен"), out);
   await ok("stop_process", { id: bgId });
+
+  /* 14. Command sandbox (Windows AppContainer / macOS Seatbelt) */
+  if (IS_WIN || IS_DARWIN) {
+    const sandboxCall = (env, command, sandboxFlag) => new Promise((resolve) => {
+      const srv = spawn(process.execPath, [path.join(REPO, "src", "index.js")], {
+        cwd: root,
+        env: {
+          ...process.env, MCP_FILE_ROOT: root, MCP_ALLOW_SHELL: "1", MCP_SANDBOX: "1",
+          ...env,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let buf = "";
+      let sent = false;
+      const timer = setTimeout(() => { srv.kill(); resolve({ timeout: true }); }, 120000);
+      srv.stdin.write(JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "smoke-sbx", version: "1" } },
+      }) + "\n");
+      srv.stdout.on("data", (c) => {
+        buf += c.toString();
+        let idx;
+        while ((idx = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          let msg;
+          try { msg = JSON.parse(line); } catch { continue; }
+          if (msg.id === 1 && !sent) {
+            sent = true;
+            const args = { command };
+            if (sandboxFlag !== undefined) args.sandbox = sandboxFlag;
+            srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+            srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "run_command", arguments: args } }) + "\n");
+          } else if (msg.id === 2) {
+            clearTimeout(timer);
+            srv.kill();
+            resolve({
+              timeout: false,
+              text: (msg.result?.content || []).map((x) => x.text || "").join("\n"),
+              isError: msg.result?.isError === true,
+            });
+          }
+        }
+      });
+    });
+
+    const real = await sandboxCall({}, "Write-Output ('ac: ' + (2+2))");
+    if (real.timeout || (real.isError && /not executed/i.test(real.text))) {
+      console.log("SKIP  sandbox run (sandbox unavailable on this machine)");
+    } else {
+      check("sandbox run", !real.isError && real.text.includes("ac: 4"), real.text);
+      check("sandbox label", /sandbox: (appcontainer|seatbelt)/.test(real.text), real.text);
+    }
+
+    const noAnswer = await sandboxCall({ CFM_SANDBOX_TEST_FAIL: "1", CFM_DIALOG_AUTO: "no" }, "Write-Output hi");
+    check("sandbox fail + No -> not executed", !noAnswer.timeout && noAnswer.text.includes("Command not executed"), noAnswer.text);
+
+    const yesAnswer = await sandboxCall({ CFM_SANDBOX_TEST_FAIL: "1", CFM_DIALOG_AUTO: "yes" }, "Write-Output ('outside: ' + (3*3))");
+    check("sandbox fail + Yes -> runs outside", !yesAnswer.timeout && yesAnswer.text.includes("outside: 9") && yesAnswer.text.includes("sandbox: outside"), yesAnswer.text);
+
+    // The AI asks to run outside the sandbox: user declines.
+    const aiNo = await sandboxCall({ CFM_DIALOG_AUTO: "no" }, "Write-Output hi", false);
+    check("ai request + No -> not executed", !aiNo.timeout && aiNo.text.includes("Command not executed") && aiNo.text.includes("did not allow"), aiNo.text);
+
+    // The AI asks to run outside the sandbox: user approves.
+    const aiYes = await sandboxCall({ CFM_DIALOG_AUTO: "yes" }, "Write-Output ('outside: ' + (4*4))", false);
+    check("ai request + Yes -> runs outside", !aiYes.timeout && aiYes.text.includes("outside: 16") && aiYes.text.includes("sandbox: outside (user approved)"), aiYes.text);
+  }
 } catch (e) {
   check("test suite completed", false, e.message);
 } finally {
