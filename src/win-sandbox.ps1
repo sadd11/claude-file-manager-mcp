@@ -242,7 +242,22 @@ try {
   #    icacls on profile folders). Instead the folder is mapped to its own
   #    drive letter with `subst` (step 5), so the container reaches it
   #    without traversing the user profile at all.
-  & icacls "$WorkingDir" /grant "*${sidString}:(OI)(CI)M" /T /C /Q | Out-Null
+  #    The grant is cached: a marker per folder skips the (potentially slow,
+  #    recursive) icacls pass on every subsequent run. For drive roots the
+  #    recursion is skipped entirely — new files inherit the rights, and
+  #    modifying pre-existing ones would need the dialog anyway.
+  $grantDir = Join-Path $containerFolder "grants"
+  New-Item -ItemType Directory -Path $grantDir -Force | Out-Null
+  $grantMarker = Join-Path $grantDir (($WorkingDir -replace '[^A-Za-z0-9]', '-') + ".done")
+  if (Test-Path -LiteralPath $grantMarker) {
+    # already granted for this folder in a previous run
+  } elseif ([IO.Path]::GetPathRoot($WorkingDir) -eq $WorkingDir) {
+    & icacls "$WorkingDir" /grant "*${sidString}:(OI)(CI)M" /C /Q | Out-Null
+    New-Item -ItemType File -Path $grantMarker -Force | Out-Null
+  } else {
+    & icacls "$WorkingDir" /grant "*${sidString}:(OI)(CI)M" /T /C /Q | Out-Null
+    New-Item -ItemType File -Path $grantMarker -Force | Out-Null
+  }
 
   # 4. Map the working folder to a free drive letter for this session.
   $substDrive = $null
