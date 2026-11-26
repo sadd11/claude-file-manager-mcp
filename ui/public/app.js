@@ -486,6 +486,8 @@ async function refreshStatus() {
   $("allowOutside").checked = state.allowOutside;
   $("allowShell").checked = state.allowShell;
   $("allowSandbox").checked = Boolean(state.sandbox);
+  $("allowDesktop").checked = Boolean(state.allowDesktop);
+  $("allowBrowser").checked = Boolean(state.allowBrowser);
   $("serverPath").textContent = state.serverEntry;
   $("configPath").textContent =
     state.desktopConfig + (state.desktopExists ? "" : " (no file yet)");
@@ -726,6 +728,24 @@ $("allowShell").addEventListener("change", async (e) => {
 $("allowSandbox").addEventListener("change", async (e) => {
   try {
     await setState({ sandbox: e.target.checked }, e.target.checked ? "Sandbox enabled — restart Claude Desktop to apply" : "Setting saved");
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    toast(err.message, true);
+  }
+});
+
+$("allowDesktop").addEventListener("change", async (e) => {
+  try {
+    await setState({ allowDesktop: e.target.checked }, "Setting saved");
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    toast(err.message, true);
+  }
+});
+
+$("allowBrowser").addEventListener("change", async (e) => {
+  try {
+    await setState({ allowBrowser: e.target.checked }, "Setting saved");
   } catch (err) {
     e.target.checked = !e.target.checked;
     toast(err.message, true);

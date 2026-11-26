@@ -35,6 +35,22 @@ import { StringDecoder } from "node:string_decoder";
 import { SANDBOX_ENABLED, runInAppContainer } from "./win-sandbox.js";
 import { ensureSeatbeltProfile, seatbeltWrap, isSandboxInfraError, SEATBELT_BIN } from "./mac-sandbox.js";
 import { showDialog } from "./dialog.js";
+import {
+  captureScreen,
+  captureWindow,
+  openPath,
+  mouseMove,
+  mouseClick,
+  mouseDrag,
+  mouseScroll,
+  keyboardType,
+  keyboardPress,
+  clipboardRead,
+  clipboardWrite,
+  showControlOverlay,
+  showPermissionDialog,
+} from "./desktop.js";
+import { relay as browserRelay, DEFAULT_PORT as BROWSER_RELAY_PORT } from "./browser-relay.js";
 
 /**
  * Allowed folders. MCP_FILE_ROOTS is a list separated by the platform path
@@ -66,6 +82,8 @@ const MAX_READ_CHARS = Number(process.env.MCP_MAX_READ_CHARS || 400_000);
 const MAX_LIST_ENTRIES = Number(process.env.MCP_MAX_LIST_ENTRIES || 5_000);
 const MAX_IMAGE_BYTES = Number(process.env.MCP_MAX_IMAGE_BYTES || 5_000_000);
 const ALLOW_SHELL = /^(1|true|yes)$/i.test(process.env.MCP_ALLOW_SHELL || "");
+const ALLOW_DESKTOP = /^(1|true|yes)$/i.test(process.env.MCP_ALLOW_DESKTOP || "");
+const ALLOW_BROWSER = /^(1|true|yes)$/i.test(process.env.MCP_ALLOW_BROWSER || "");
 const MAX_OUTPUT_CHARS = Number(process.env.MCP_MAX_OUTPUT_CHARS || 200_000);
 const SHELL_TIMEOUT_DEFAULT = 30_000;
 const SHELL_TIMEOUT_MAX = 300_000;
@@ -1748,6 +1766,76 @@ async function confirmDangerous(message) {
       e instanceof Error ? e.message : e,
     );
     return null;
+  }
+}
+
+/**
+ * Asks the user for permission before a sensitive desktop/browser action.
+ * Returns true when accepted, false on decline.
+ * Uses MCP elicitation first; falls back to a local on-screen dialog if the
+ * client cannot ask. Throws if the user declines or no dialog is available.
+ */
+async function confirmDesktopAction(message) {
+  // 1) Try MCP elicitation (the client shows a native Allow/Deny dialog)
+  try {
+    const result = await server.server.request(
+      {
+        method: "elicitation/create",
+        params: {
+          mode: "form",
+          message,
+          requestedSchema: {
+            type: "object",
+            properties: {
+              confirm: {
+                type: "boolean",
+                title: "Allow",
+                description: "true — permit this action",
+              },
+            },
+            required: ["confirm"],
+          },
+        },
+      },
+      ElicitResultSchema,
+    );
+    if (result?.action === "accept") {
+      if (result.content?.confirm === true) return true;
+      throw new Error("User declined the action.");
+    }
+    throw new Error("User declined the action.");
+  } catch (e) {
+    const elicitationError = e instanceof Error ? e.message : String(e);
+    // If elicitation is not available at all, fall back to a local dialog.
+    if (
+      !elicitationError.includes("elicitation is not available") &&
+      !elicitationError.includes("User declined")
+    ) {
+      // Re-throw non-availability errors so the caller sees them.
+      if (!elicitationError.includes("not available")) throw e;
+    }
+  }
+
+  // 2) Fallback: local on-screen permission dialog
+  const local = showPermissionDialog({
+    message,
+    detail:
+      "This gives the AI control over your mouse, keyboard, screen, clipboard " +
+      "or browser. Only allow if you trust the current session.",
+  });
+  if (local === "yes") return true;
+  throw new Error("User declined the action (no permission granted).");
+}
+
+/**
+ * Convenience wrapper: asks for permission and returns true/false without
+ * throwing. Used by all desktop/browser tools.
+ */
+async function askPermission(message) {
+  try {
+    return await confirmDesktopAction(message);
+  } catch {
+    return false;
   }
 }
 
@@ -4023,6 +4111,797 @@ if (ALLOW_SHELL) {
   );
 }
 
+/* ---------------------------------- desktop --------------------------------- */
+
+if (ALLOW_DESKTOP) {
+  const SCREENSHOT_DIR = path.join(DATA_DIR, "screenshots");
+
+  server.registerTool(
+    "screenshot_screen",
+    {
+      title: "Screenshot the whole screen",
+      description:
+        "Captures the entire screen and saves it as a PNG image file inside " +
+        "the allowed folders. Returns the image so it can be viewed. " +
+        "Requires MCP_ALLOW_DESKTOP=1. Platform tools: PowerShell (Windows), " +
+        "screencapture (macOS), scrot/gnome-screenshot/import (Linux).",
+      inputSchema: {
+        path: z
+          .string()
+          .default("screenshot.png")
+          .describe(
+            "Where to save the PNG (relative to root or absolute inside it)",
+          ),
+        quality: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(90)
+          .describe("JPEG/PNG quality (1-100)"),
+      },
+    },
+    async ({ path: inputPath, quality }) => {
+      const allowed = await askPermission(
+        "AI wants to take a screenshot of your entire screen. Allow?",
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow screenshot.");
+      }
+      await showControlOverlay();
+      try {
+        fs.mkdir(SCREENSHOT_DIR, { recursive: true });
+        const abs = resolvePath(inputPath);
+        assertNotData(abs);
+        const result = await captureScreen({ outputPath: abs, quality });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Screenshot failed (code ${result.code})`));
+        }
+        const stat = await fs.stat(abs);
+        const buf = await fs.readFile(abs);
+        return {
+          content: [
+            {
+              type: "image",
+              data: buf.toString("base64"),
+              mimeType: "image/png",
+            },
+            {
+              type: "text",
+              text: `Screenshot saved: ${abs} (${formatBytes(stat.size)})`,
+            },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "screenshot_window",
+    {
+      title: "Screenshot a specific window",
+      description:
+        "Captures a specific application window by its title substring and " +
+        "saves it as a PNG. Requires MCP_ALLOW_DESKTOP=1. " +
+        "Windows: PowerShell FindWindow + PrintWindow. macOS: screencapture -l. " +
+        "Linux: xwininfo + import.",
+      inputSchema: {
+        title: z.string().describe("Window title substring to match"),
+        path: z
+          .string()
+          .default("window-screenshot.png")
+          .describe(
+            "Where to save the PNG (relative to root or absolute inside it)",
+          ),
+        quality: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(90)
+          .describe("PNG quality (1-100)"),
+      },
+    },
+    async ({ title, path: inputPath, quality }) => {
+      const allowed = await askPermission(
+        "AI wants to take a screenshot of a window on your screen. Allow?",
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow screenshot.");
+      }
+      await showControlOverlay();
+      try {
+        fs.mkdir(SCREENSHOT_DIR, { recursive: true });
+        const abs = resolvePath(inputPath);
+        assertNotData(abs);
+        const result = await captureWindow({
+          identifier: title,
+          outputPath: abs,
+          quality,
+        });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Window screenshot failed (code ${result.code})`));
+        }
+        const stat = await fs.stat(abs);
+        const buf = await fs.readFile(abs);
+        return {
+          content: [
+            {
+              type: "image",
+              data: buf.toString("base64"),
+              mimeType: "image/png",
+            },
+            {
+              type: "text",
+              text: `Window screenshot saved: ${abs} (${formatBytes(stat.size)})`,
+            },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "open_path",
+    {
+      title: "Open a file or program",
+      description:
+        "Opens a file with its default application, or launches a program. " +
+        "Uses `start` (Windows), `open` (macOS), or `xdg-open` (Linux). " +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        target: z.string().describe("File path, URL, or program name to open"),
+      },
+    },
+    async ({ target }) => {
+      const allowed = await askPermission(
+        `AI wants to open "${target}" on your computer. Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow opening a file or program.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await openPath({ target });
+        if (result.code !== 0 && result.stderr) {
+          return fail(new Error(result.stderr || `Open failed (code ${result.code})`));
+        }
+        return text(`Opened: ${target}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "mouse_move",
+    {
+      title: "Move the mouse cursor",
+      description: "Moves the mouse cursor to screen coordinates (x, y). " +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        x: z.number().int().describe("Screen X coordinate"),
+        y: z.number().int().describe("Screen Y coordinate"),
+      },
+    },
+    async ({ x, y }) => {
+      const allowed = await askPermission(
+        `AI wants to move the mouse cursor to (${x}, ${y}). Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow mouse control.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await mouseMove({ x, y });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Mouse move failed (code ${result.code})`));
+        }
+        return text(`Mouse moved to (${x}, ${y})`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "mouse_click",
+    {
+      title: "Click the mouse",
+      description: "Clicks the mouse at screen coordinates (x, y). " +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        x: z.number().int().describe("Screen X coordinate"),
+        y: z.number().int().describe("Screen Y coordinate"),
+        button: z
+          .enum(["left", "right"])
+          .default("left")
+          .describe("Mouse button"),
+        count: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .default(1)
+          .describe("Number of clicks"),
+      },
+    },
+    async ({ x, y, button, count }) => {
+      const allowed = await askPermission(
+        `AI wants to click the ${button} mouse button at (${x}, ${y}) ${count} time(s). Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow mouse control.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await mouseClick({ x, y, button, count });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Mouse click failed (code ${result.code})`));
+        }
+        return text(`Clicked ${button} button ${count}x at (${x}, ${y})`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "mouse_drag",
+    {
+      title: "Drag the mouse",
+      description: "Drags the mouse from (x1, y1) to (x2, y2) with the left " +
+        "button held down. Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        x1: z.number().int().describe("Start X"),
+        y1: z.number().int().describe("Start Y"),
+        x2: z.number().int().describe("End X"),
+        y2: z.number().int().describe("End Y"),
+      },
+    },
+    async ({ x1, y1, x2, y2 }) => {
+      const allowed = await askPermission(
+        `AI wants to drag the mouse from (${x1}, ${y1}) to (${x2}, ${y2}). Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow mouse control.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await mouseDrag({ x1, y1, x2, y2 });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Mouse drag failed (code ${result.code})`));
+        }
+        return text(`Dragged from (${x1}, ${y1}) to (${x2}, ${y2})`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "mouse_scroll",
+    {
+      title: "Scroll the mouse wheel",
+      description: "Scrolls at screen coordinates (x, y). Positive deltaY " +
+        "scrolls up, negative scrolls down. Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        x: z.number().int().describe("Screen X coordinate"),
+        y: z.number().int().describe("Screen Y coordinate"),
+        deltaX: z
+          .number()
+          .int()
+          .default(0)
+          .describe("Horizontal scroll (positive = right)"),
+        deltaY: z
+          .number()
+          .int()
+          .default(0)
+          .describe("Vertical scroll (positive = up)"),
+      },
+    },
+    async ({ x, y, deltaX, deltaY }) => {
+      const allowed = await askPermission(
+        `AI wants to scroll the mouse at (${x}, ${y}) (deltaX=${deltaX}, deltaY=${deltaY}). Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow mouse control.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await mouseScroll({ x, y, deltaX, deltaY });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Mouse scroll failed (code ${result.code})`));
+        }
+        return text(`Scrolled at (${x}, ${y}) deltaX=${deltaX} deltaY=${deltaY}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "keyboard_type",
+    {
+      title: "Type text",
+      description: "Types text as if entered on the keyboard. " +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        text: z.string().describe("Text to type"),
+      },
+    },
+    async ({ text }) => {
+      const allowed = await askPermission(
+        `AI wants to type text on your keyboard: "${text}". Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow keyboard control.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await keyboardType({ text });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Keyboard type failed (code ${result.code})`));
+        }
+        return text(`Typed: ${text}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "keyboard_press",
+    {
+      title: "Press keys",
+      description: "Presses one or more keys (or a key combination). " +
+        'Examples: ["enter"], ["ctrl", "c"], ["alt", "tab"]. ' +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        keys: z
+          .array(z.string())
+          .min(1)
+          .describe("Keys to press, e.g. [\"enter\"] or [\"ctrl\", \"c\"]"),
+      },
+    },
+    async ({ keys }) => {
+      const allowed = await askPermission(
+        `AI wants to press keys on your keyboard: ${keys.join(" + ")}. Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow keyboard control.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await keyboardPress({ keys });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Keyboard press failed (code ${result.code})`));
+        }
+        return text(`Pressed keys: ${keys.join(" + ")}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "clipboard_read",
+    {
+      title: "Read clipboard",
+      description: "Reads text from the system clipboard. " +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {},
+    },
+    async () => {
+      const allowed = await askPermission(
+        "AI wants to read your clipboard contents. Allow?",
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow clipboard read.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await clipboardRead();
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Clipboard read failed (code ${result.code})`));
+        }
+        return text(result.stdout || "(clipboard empty)");
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "clipboard_write",
+    {
+      title: "Write to clipboard",
+      description: "Writes text to the system clipboard. " +
+        "Requires MCP_ALLOW_DESKTOP=1.",
+      inputSchema: {
+        text: z.string().describe("Text to copy to the clipboard"),
+      },
+    },
+    async ({ text }) => {
+      const allowed = await askPermission(
+        `AI wants to write to your clipboard: "${text}". Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow clipboard write.");
+      }
+      await showControlOverlay();
+      try {
+        const result = await clipboardWrite({ text });
+        if (result.code !== 0) {
+          return fail(new Error(result.stderr || `Clipboard write failed (code ${result.code})`));
+        }
+        return text(`Copied to clipboard: ${text}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+}
+
+/* ---------------------------------- browser --------------------------------- */
+
+if (ALLOW_BROWSER) {
+  let browserRelayStarted = false;
+
+  async function ensureRelay() {
+    if (!browserRelayStarted) {
+      await browserRelay.start({ port: BROWSER_RELAY_PORT });
+      browserRelayStarted = true;
+    }
+  }
+
+  server.registerTool(
+    "browser_info",
+    {
+      title: "Browser relay connection info",
+      description:
+        "Returns the WebSocket/HTTP relay URL that Chrome and Firefox " +
+        "extensions should connect to. Install the extension from " +
+        "browser-extension/ and connect it to this relay. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        await ensureRelay();
+        return text(
+          `Browser relay running at http://127.0.0.1:${BROWSER_RELAY_PORT}\n` +
+            `Extension folder: ${path.resolve(__dirname, "..", "browser-extension")}\n` +
+            `Load the extension in Chrome (chrome://extensions) or Firefox ` +
+            `(about:debugging), then it will auto-connect.\n` +
+            `Connected browsers: ${browserRelay.listBrowsers().length}`,
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_list",
+    {
+      title: "List connected browsers",
+      description: "Lists browsers currently connected to the relay. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        await ensureRelay();
+        const browsers = browserRelay.listBrowsers();
+        if (!browsers.length) {
+          return text("No browsers connected. Open Chrome/Firefox with the extension loaded.");
+        }
+        const lines = browsers.map(
+          (b) => `${b.key}  ${b.browser} ${b.version}  (tab ${b.tabId})`,
+        );
+        return text(`Connected browsers (${browsers.length}):\n\n${lines.join("\n")}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_navigate",
+    {
+      title: "Navigate browser to a URL",
+      description:
+        "Tells a connected browser to navigate to a URL. " +
+        "Requires MCP_ALLOW_BROWSER=1 and a connected browser.",
+      inputSchema: {
+        url: z.string().describe("URL to navigate to"),
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key (e.g. "chrome:12345") or "any"/"last"'),
+      },
+    },
+    async ({ url, browser }) => {
+      const allowed = await askPermission(
+        `AI wants to control your browser and navigate to ${url}. Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser control.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "navigate",
+          target: url,
+          timeoutMs: 15_000,
+        });
+        return text(`Navigated to ${url}\n${JSON.stringify(data)}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_click",
+    {
+      title: "Click an element in the browser",
+      description:
+        "Clicks an element matching a CSS selector in a connected browser. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {
+        selector: z.string().describe("CSS selector, e.g. \".btn\" or \"#submit\""),
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key or "any"/"last"'),
+      },
+    },
+    async ({ selector, browser }) => {
+      const allowed = await askPermission(
+        `AI wants to click "${selector}" in your browser. Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser control.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "click",
+          target: selector,
+          timeoutMs: 10_000,
+        });
+        return text(`Clicked: ${selector}\n${JSON.stringify(data)}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_type",
+    {
+      title: "Type into a browser element",
+      description:
+        "Types text into a form field matching a CSS selector. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {
+        selector: z.string().describe("CSS selector of the input element"),
+        text: z.string().describe("Text to type"),
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key or "any"/"last"'),
+      },
+    },
+    async ({ selector, text, browser }) => {
+      const allowed = await askPermission(
+        `AI wants to type "${text}" into "${selector}" in your browser. Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser control.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "type",
+          target: selector,
+          value: text,
+          timeoutMs: 10_000,
+        });
+        return text(`Typed into ${selector}: ${text}\n${JSON.stringify(data)}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_evaluate",
+    {
+      title: "Evaluate JavaScript in the browser",
+      description:
+        "Runs a JavaScript expression in the page context of a connected " +
+        "browser and returns the result as JSON. Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {
+        script: z.string().describe("JavaScript expression to evaluate"),
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key or "any"/"last"'),
+      },
+    },
+    async ({ script, browser }) => {
+      const allowed = await askPermission(
+        `AI wants to run JavaScript in your browser: ${script.slice(0, 80)}${script.length > 80 ? "…" : ""}. Allow?`,
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser control.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "evaluate",
+          target: null,
+          value: script,
+          timeoutMs: 10_000,
+        });
+        return text(`Result: ${JSON.stringify(data)}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_screenshot",
+    {
+      title: "Screenshot the browser tab",
+      description:
+        "Captures a screenshot of the current browser tab (visible area) " +
+        "using the extension's native capture API. Returns the image. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key or "any"/"last"'),
+      },
+    },
+    async ({ browser }) => {
+      const allowed = await askPermission(
+        "AI wants to take a screenshot of your browser tab. Allow?",
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser screenshot.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "screenshot",
+          target: null,
+          value: null,
+          timeoutMs: 15_000,
+        });
+        const screenshotData = data && data.screenshot ? data.screenshot : null;
+        if (!screenshotData) {
+          return fail(new Error("No screenshot data returned by browser"));
+        }
+        // data URL: data:image/png;base64,...
+        const match = screenshotData.match(/^data:image\/png;base64,(.+)$/);
+        const base64 = match ? match[1] : screenshotData;
+        const buf = Buffer.from(base64, "base64");
+        return {
+          content: [
+            {
+              type: "image",
+              data: base64,
+              mimeType: "image/png",
+            },
+            {
+              type: "text",
+              text: `Browser screenshot captured (${formatBytes(buf.length)})`,
+            },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_title",
+    {
+      title: "Get the browser page title",
+      description:
+        "Returns the title of the current page in a connected browser. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key or "any"/"last"'),
+      },
+    },
+    async ({ browser }) => {
+      const allowed = await askPermission(
+        "AI wants to read your browser page title. Allow?",
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser control.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "get-title",
+          target: null,
+          value: null,
+          timeoutMs: 10_000,
+        });
+        return text(`Page title: ${data.title}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browser_url",
+    {
+      title: "Get the browser page URL",
+      description:
+        "Returns the URL of the current page in a connected browser. " +
+        "Requires MCP_ALLOW_BROWSER=1.",
+      inputSchema: {
+        browser: z
+          .string()
+          .default("any")
+          .describe('Browser key or "any"/"last"'),
+      },
+    },
+    async ({ browser }) => {
+      const allowed = await askPermission(
+        "AI wants to read your browser page URL. Allow?",
+      );
+      if (!allowed) {
+        return text("Cancelled: user did not allow browser control.");
+      }
+      await showControlOverlay();
+      try {
+        await ensureRelay();
+        const data = await browserRelay.sendCommand({
+          browserId: browser,
+          action: "get-url",
+          target: null,
+          value: null,
+          timeoutMs: 10_000,
+        });
+        return text(`Page URL: ${data.url}`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+}
+
 /* -------------------------------- resources -------------------------------- */
 
 server.registerResource(
@@ -4219,12 +5098,33 @@ async function main() {
       `[claude-file-manager] MCP_ALLOW_SHELL=1 — terminal tools are enabled (shell: ${SHELL_MODE}).`,
     );
   }
+  if (ALLOW_DESKTOP) {
+    console.error(
+      "[claude-file-manager] MCP_ALLOW_DESKTOP=1 — desktop tools are enabled (screenshots, mouse, keyboard, open).",
+    );
+  }
+  if (ALLOW_BROWSER) {
+    try {
+      await browserRelay.start({ port: BROWSER_RELAY_PORT });
+      console.error(
+        `[claude-file-manager] MCP_ALLOW_BROWSER=1 — browser relay on http://127.0.0.1:${BROWSER_RELAY_PORT}.`,
+      );
+    } catch (e) {
+      console.error(
+        `[claude-file-manager] Warning: browser relay failed to start: ${e.message}`,
+      );
+    }
+  }
 }
 
-process.on("exit", stopAllProcesses);
+process.on("exit", () => {
+  stopAllProcesses();
+  if (ALLOW_BROWSER) browserRelay.stop();
+});
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
     stopAllProcesses();
+    if (ALLOW_BROWSER) browserRelay.stop();
     process.exit(0);
   });
 }

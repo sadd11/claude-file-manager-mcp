@@ -55,6 +55,8 @@ let state = {
   allowOutside: false,
   allowShell: false,
   sandbox: false,
+  allowDesktop: false,
+  allowBrowser: false,
   recent: [],
 };
 
@@ -140,6 +142,8 @@ async function loadState() {
     state.allowOutside = Boolean(parsed.allowOutside);
     state.allowShell = Boolean(parsed.allowShell);
     state.sandbox = Boolean(parsed.sandbox);
+    state.allowDesktop = Boolean(parsed.allowDesktop);
+    state.allowBrowser = Boolean(parsed.allowBrowser);
     if (Array.isArray(parsed.recent)) {
       state.recent = parsed.recent
         .filter((item) => typeof item === "string" && item.trim())
@@ -232,6 +236,10 @@ function buildServerEntry(existing = null) {
   else delete env.MCP_ALLOW_SHELL;
   if (state.sandbox) env.MCP_SANDBOX = "1";
   else delete env.MCP_SANDBOX;
+  if (state.allowDesktop) env.MCP_ALLOW_DESKTOP = "1";
+  else delete env.MCP_ALLOW_DESKTOP;
+  if (state.allowBrowser) env.MCP_ALLOW_BROWSER = "1";
+  else delete env.MCP_ALLOW_BROWSER;
   return { command: NODE_BIN, args: [SERVER_ENTRY], env };
 }
 
@@ -251,6 +259,8 @@ function buildCodeCommand() {
   if (state.allowOutside) parts.push("--env MCP_ALLOW_OUTSIDE_ROOT=1");
   if (state.allowShell) parts.push("--env MCP_ALLOW_SHELL=1");
   if (state.sandbox) parts.push("--env MCP_SANDBOX=1");
+  if (state.allowDesktop) parts.push("--env MCP_ALLOW_DESKTOP=1");
+  if (state.allowBrowser) parts.push("--env MCP_ALLOW_BROWSER=1");
   parts.push("--", q(NODE_BIN), q(SERVER_ENTRY));
   return parts.join(" ");
 }
@@ -346,6 +356,8 @@ function checkServer() {
     const env = applyRoots({ ...process.env });
     if (state.allowOutside) env.MCP_ALLOW_OUTSIDE_ROOT = "1";
     if (state.allowShell) env.MCP_ALLOW_SHELL = "1";
+    if (state.allowDesktop) env.MCP_ALLOW_DESKTOP = "1";
+    if (state.allowBrowser) env.MCP_ALLOW_BROWSER = "1";
     delete env.MCP_DATA_DIR;
 
     const child = spawn(NODE_BIN, [SERVER_ENTRY], {
@@ -1054,6 +1066,8 @@ async function handleApi(req, res, url) {
       allowOutside: state.allowOutside,
       allowShell: state.allowShell,
       sandbox: state.sandbox,
+      allowDesktop: state.allowDesktop,
+      allowBrowser: state.allowBrowser,
       recent: state.recent,
       serverEntry: SERVER_ENTRY,
       desktopConfig: desktop,
@@ -1139,6 +1153,12 @@ async function handleApi(req, res, url) {
     if (body.sandbox !== undefined) {
       state.sandbox = Boolean(body.sandbox);
     }
+    if (body.allowDesktop !== undefined) {
+      state.allowDesktop = Boolean(body.allowDesktop);
+    }
+    if (body.allowBrowser !== undefined) {
+      state.allowBrowser = Boolean(body.allowBrowser);
+    }
     await saveState();
     return sendJson(res, 200, {
       root: state.root,
@@ -1147,6 +1167,8 @@ async function handleApi(req, res, url) {
       allowOutside: state.allowOutside,
       allowShell: state.allowShell,
       sandbox: state.sandbox,
+      allowDesktop: state.allowDesktop,
+      allowBrowser: state.allowBrowser,
       recent: state.recent,
     });
   }

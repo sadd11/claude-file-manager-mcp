@@ -38,10 +38,112 @@ It runs locally over `stdio`, without internet access or third-party services.
 | `read_output`      | Reads the output of a background process                 |
 | `stop_process`     | Stops a background process and its children             |
 | `list_processes`   | Lists background processes of this session              |
+| `screenshot_screen`| Screenshot of the whole screen (optional, off by default)|
+| `screenshot_window`| Screenshot of a specific window (optional, off by default)|
+| `open_path`        | Opens a file or program (optional, off by default)       |
+| `mouse_move`       | Moves the mouse cursor (optional, off by default)        |
+| `mouse_click`      | Clicks the mouse button (optional, off by default)       |
+| `mouse_drag`       | Drags the mouse from one point to another (optional)     |
+| `mouse_scroll`     | Scrolls the mouse wheel (optional, off by default)       |
+| `keyboard_type`    | Types text as on the keyboard (optional, off by default) |
+| `keyboard_press`   | Presses one or more keys / key combos (optional)         |
+| `clipboard_read`   | Reads the system clipboard text (optional, off by default)|
+| `clipboard_write`  | Writes text to the system clipboard (optional)           |
+| `browser_info`     | Browser relay connection info (optional, off by default) |
+| `browser_list`     | Lists connected browsers (optional, off by default)      |
+| `browser_navigate` | Navigates a connected browser to a URL (optional)        |
+| `browser_click`    | Clicks a CSS selector element in the browser (optional)  |
+| `browser_type`     | Types text into a browser form field (optional)          |
+| `browser_evaluate` | Runs JavaScript in a connected browser page (optional)   |
+| `browser_screenshot`| Captures a screenshot of the browser tab (optional)      |
+| `browser_title`    | Returns the browser page title (optional)                |
+| `browser_url`      | Returns the browser page URL (optional)                  |
 
 That is 28 tools with the terminal enabled and 23 without. The five terminal
 tools are disabled unless `MCP_ALLOW_SHELL=1` is set. All other tools work with
 files only.
+
+## Desktop automation (optional)
+
+### What it adds
+
+- **Screenshots:** `screenshot_screen` (whole screen) and `screenshot_window`
+  (a window by its title substring) save PNG images to the allowed folder and
+  return them so Claude can see them.
+- **Opening files/programs:** `open_path` launches a file with its default app
+  or starts a program (`start` on Windows, `open` on macOS, `xdg-open` on
+  Linux).
+- **Mouse:** `mouse_move`, `mouse_click`, `mouse_drag`, `mouse_scroll`.
+- **Keyboard:** `keyboard_type` (arbitrary text) and `keyboard_press`
+  (single keys or combinations like `["ctrl", "c"]`).
+- **Clipboard:** `clipboard_read` and `clipboard_write`.
+
+### Permission flow
+
+Before every desktop action Claude asks you for permission through the MCP
+client dialog ("Allow?"). If your client cannot show dialogs, a local on-screen
+window appears with **Разрешить / Запретить** buttons. While automation is
+active a notification "AI is controlling your computer" is shown on screen.
+
+Enable it by adding to the server env:
+
+```json
+"MCP_ALLOW_DESKTOP": "1"
+```
+
+## Browser control via extension (Chrome + Firefox)
+
+### What it adds
+
+Claude can control a real browser window through a small browser extension
+that connects to a local relay started by the MCP server.
+
+Tools:
+
+- `browser_info` — relay URL and extension folder path
+- `browser_list` — connected browsers
+- `browser_navigate(url)` — go to a URL
+- `browser_click(selector)` — click a CSS selector element
+- `browser_type(selector, text)` — type into a form field
+- `browser_evaluate(script)` — run JavaScript in the page
+- `browser_screenshot()` — screenshot of the current tab (returned as image)
+- `browser_title()` — page title
+- `browser_url()` — page URL
+
+### How to set up
+
+1. Add to the server env:
+
+   ```json
+   "MCP_ALLOW_BROWSER": "1"
+   ```
+
+   Then fully restart Claude Desktop so the relay starts
+   on `http://127.0.0.1:4318`.
+
+2. Call `browser_info` in Claude — it prints the extension folder path
+   (`browser-extension/` inside the project).
+
+3. **Install the extension:**
+   - **Chrome:** go to `chrome://extensions`, enable **Режим разработчика**,
+     click **Загрузить распакованное** and choose the `browser-extension/`
+     folder.
+   - **Firefox:** go to `about:debugging`, click **Этот Firefox** →
+     **Загрузить временное дополнение** and choose `browser-extension/
+     manifest.json`.
+
+4. The extension auto-connects to the relay. Call `browser_list` to verify,
+   then use `browser_navigate`, `browser_click`, etc.
+
+### Permission flow
+
+Before every browser action Claude asks you for permission ("Allow?") and shows
+the "AI is controlling your computer" on-screen notification while the action
+runs.
+
+> The extension only works on pages you open yourself. It cannot access pages
+> you did not open, and the relay listens on `127.0.0.1` only.
+
 
 ## Windows installation (prebuilt installer)
 
@@ -123,6 +225,27 @@ On macOS/Linux several roots are separated by `:` in `MCP_FILE_ROOTS`, and the
 terminal tool runs commands through `/bin/sh` (`MCP_SHELL=bash` for bash).
 Everything else — tools, trash, backups, undo, the setup UI — is identical.
 Every push is smoke-tested on macOS, Linux and Windows runners in CI.
+
+### Linux: required tools for desktop automation
+
+The desktop tools (`screenshot_*`, `open_path`, `mouse_*`, `keyboard_*`,
+`clipboard_*`) on Linux depend on utilities that may not be installed by
+default. Install them if you plan to use `MCP_ALLOW_DESKTOP=1`:
+
+- **scrot** or **gnome-screenshot** or **ImageMagick (`import`)** — screenshots
+- **xdotool** — mouse movement/click/drag/scroll and keyboard typing
+- **xdg-open** — opening files and programs (usually preinstalled)
+- **xsel** — clipboard read/write
+- **zenity** — permission dialog and "AI is controlling" overlay
+
+Example (Debian/Ubuntu):
+
+```bash
+sudo apt-get install scrot xdotool xsel zenity xdg-utils
+```
+
+If a tool is missing, the corresponding action returns an error instead of
+crashing the server.
 
 ### Building the installer
 
@@ -363,6 +486,8 @@ the switch off unless you need it, and read a command before you approve it.
 | `MCP_DATA_DIR`           | `<root>/.mcp`      | Where to store trash, backups and history            |
 | `MCP_REQUIRE_READ`       | `1`                | `0` — allow editing files that were not read first   |
 | `MCP_SANDBOX`            | `0`                | `1` — isolate terminal commands (Windows: AppContainer, macOS: Seatbelt) |
+| `MCP_ALLOW_DESKTOP`      | `0`                | `1` — register desktop tools (screenshots, mouse, keyboard, clipboard, open) |
+| `MCP_ALLOW_BROWSER`      | `0`                | `1` — register browser control tools and start the local relay on port 4318 |
 | `UI_PORT`                | `4317`             | Local UI port (`npm run ui`)                         |
 | `UI_NO_OPEN`             | —                  | `1` — do not open the browser automatically          |
 

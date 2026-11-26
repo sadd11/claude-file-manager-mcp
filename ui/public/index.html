@@ -135,6 +135,24 @@
           </span>
         </label>
 
+        <label class="checkbox">
+          <input type="checkbox" id="allowDesktop" />
+          <span>
+            Allow desktop control (screenshots, mouse, keyboard, clipboard)
+            <span class="badge beta">Beta</span>
+            <small>Off by default. The AI can take screenshots, move/click the mouse, type on the keyboard, open files and programs, and read or write the clipboard. Each action asks for your permission first.</small>
+          </span>
+        </label>
+
+        <label class="checkbox">
+          <input type="checkbox" id="allowBrowser" />
+          <span>
+            Allow browser control via extension (Chrome + Firefox)
+            <span class="badge beta">Beta</span>
+            <small>Off by default. Starts a local relay on port 4318. Install the extension from browser-extension/ to let Claude navigate, click, type and screenshot in a real browser. Each action asks for your permission first.</small>
+          </span>
+        </label>
+
         <div class="actions">
           <button id="connectDesktop" class="primary" type="button">
             Connect to Claude Desktop

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Тестовое окно — Claude File Manager Desktop Automation</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0; padding: 24px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    color: #222;
+  }
+  .container {
+    max-width: 900px;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 16px;
+    padding: 32px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  h1 { margin-top: 0; color: #4a5568; }
+  .section { margin-bottom: 28px; padding-bottom: 20px; border-bottom: 1px solid #e2e8f0; }
+  .section:last-child { border-bottom: none; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; color: #4a5568; }
+  input[type="text"], input[type="number"], textarea, select {
+    width: 100%; padding: 10px 14px; border: 2px solid #cbd5e0;
+    border-radius: 8px; font-size: 15px; margin-bottom: 12px;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: #667eea; }
+  button {
+    background: #667eea; color: #fff; border: none; padding: 12px 24px;
+    border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer;
+    margin-right: 10px; margin-bottom: 10px;
+  }
+  button:hover { background: #5a67d8; }
+  button:active { transform: scale(0.97); }
+  .btn-secondary { background: #a0aec0; }
+  .btn-secondary:hover { background: #718096; }
+  .btn-danger { background: #e53e3e; }
+  .btn-danger:hover { background: #c53030; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .card {
+    background: #f7fafc; border: 2px dashed #cbd5e0; border-radius: 8px;
+    padding: 16px; text-align: center; cursor: pointer;
+  }
+  .card:hover { border-color: #667eea; background: #ebf4ff; }
+  .card.clicked { background: #c6f6d5; border-color: #38a169; }
+  #log {
+    background: #edf2f7; border-radius: 8px; padding: 14px;
+    font-family: Consolas, monospace; font-size: 13px; max-height: 200px;
+    overflow-y: auto; border: 1px solid #cbd5e0;
+  }
+  .log-entry { margin: 4px 0; padding: 4px 0; border-bottom: 1px solid #cbd5e0; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 12px; font-weight: 700; color: #fff;
+  }
+  .badge-info { background: #4299e1; }
+  .badge-ok { background: #38a169; }
+  .badge-warn { background: #d69e2e; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🖥️ Тестовое окно для автоматизации</h1>
+  <p>Используй этот экран для проверки инструментов Claude File Manager:
+  скриншоты, мышь, клавиатура, управление браузером.</p>
+
+  <div class="section">
+    <h2>1. Кнопки для клика (mouse_click)</h2>
+    <div class="grid">
+      <div class="card" id="btnA" onclick="log('clicked A')">Кнопка A</div>
+      <div class="card" id="btnB" onclick="log('clicked B')">Кнопка B</div>
+      <div class="card" id="btnC" onclick="log('clicked C')">Кнопка C</div>
+      <div class="card" id="btnD" onclick="log('clicked D')">Кнопка D</div>
+    </div>
+    <p>Селекторы: <code>#btnA</code>, <code>#btnB</code>, <code>#btnC</code>, <code>#btnD</code></p>
+  </div>
+
+  <div class="section">
+    <h2>2. Поле ввода (keyboard_type, browser_type)</h2>
+    <label for="testInput">Текстовое поле:</label>
+    <input type="text" id="testInput" placeholder="Напиши сюда что-нибудь...">
+    <p>Селектор: <code>#testInput</code></p>
+  </div>
+
+  <div class="section">
+    <h2>3. Текстовая область</h2>
+    <textarea id="testArea" rows="5" placeholder="Многострочное поле..."></textarea>
+    <p>Селектор: <code>#testArea</code></p>
+  </div>
+
+  <div class="section">
+    <h2>4. Выпадающий список</h2>
+    <label for="testSelect">Выберите опцию:</label>
+    <select id="testSelect">
+      <option value="opt1">Опция 1</option>
+      <option value="opt2">Опция 2</option>
+      <option value="opt3">Опция 3</option>
+    </select>
+    <p>Селектор: <code>#testSelect</code></p>
+  </div>
+
+  <div class="section">
+    <h2>5. Чекбокс и радиокнопки</h2>
+    <label><input type="checkbox" id="testCheckbox"> Я согласен</label><br><br>
+    <label><input type="radio" name="rg" id="r1" value="1"> Да</label>
+    <label><input type="radio" name="rg" id="r2" value="2"> Нет</label>
+    <label><input type="radio" name="rg" id="r3" value="3"> Возможно</label>
+    <p>Селекторы: <code>#testCheckbox</code>, <code>#r1</code>, <code>#r2</code>, <code>#r3</code></p>
+  </div>
+
+  <div class="section">
+    <h2>6. Управление тестом</h2>
+    <button class="btn-danger" onclick="clearLog()">Очистить лог</button>
+    <button onclick="window.location.reload()">Перезагрузить страницу</button>
+    <button onclick="alert('Тест alert сработал!')">Тест alert</button>
+  </div>
+
+  <div class="section">
+    <h2>7. Лог событий</h2>
+    <div id="log">Нажмите на элементы выше, чтобы увидеть события здесь...</div>
+  </div>
+</div>
+
+<script>
+  function log(msg) {
+    const el = document.getElementById('log');
+    const now = new Date().toLocaleTimeString('ru-RU');
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.textContent = `[${now}] ${msg}`;
+    el.prepend(entry);
+  }
+
+  function clearLog() {
+    document.getElementById('log').innerHTML = 'Лог очищен.';
+  }
+
+  // Логируем клики по любым элементам
+  document.addEventListener('click', (e) => {
+    if (e.target.id) log(`клик по #${e.target.id}`);
+    if (e.target.tagName === 'BUTTON') log(`кнопка: ${e.target.textContent.trim()}`);
+  });
+
+  // Логируем ввод
+  document.getElementById('testInput').addEventListener('input', (e) => {
+    log(`ввод в #testInput: "${e.target.value}"`);
+  });
+  document.getElementById('testArea').addEventListener('input', (e) => {
+    log(`ввод в #testArea`);
+  });
+  document.getElementById('testSelect').addEventListener('change', (e) => {
+    log(`выбор в #testSelect: ${e.target.value}`);
+  });
+  document.getElementById('testCheckbox').addEventListener('change', (e) => {
+    log(`чекбокс: ${e.target.checked}`);
+  });
+</script>
+</body>
+</html>

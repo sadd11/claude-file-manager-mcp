@@ -98,6 +98,12 @@ svg {
   padding: 2px 7px;
 }
 
+.badge.beta {
+  color: #c77dff;
+  border-color: rgba(199, 125, 255, 0.35);
+  background: rgba(199, 125, 255, 0.08);
+}
+
 .status {
   display: flex;
   align-items: center;
